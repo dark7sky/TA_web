@@ -2,6 +2,17 @@
 .env
 .env.*
 !.env.example
+auth
+config
+*.bak
+*.txt
+!requirements.txt
+*.exe
+*.bat
+*.json
+*.spec
+*.checker
+ss.ratio
 
 # Keep only target Python sources by default
 *.py
