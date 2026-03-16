@@ -1,0 +1,48 @@
+# Sensitive env files
+.env
+.env.*
+!.env.example
+
+# Keep only target Python sources by default
+*.py
+!KB.py
+!KB_web.py
+!cards.py
+!logger.py
+!notify_telegram.py
+!client.py
+!Focus_window.py
+!keys_qmenu.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local artifacts and runtime outputs
+*.pickle
+*.log
+log_*
+*.db
+*.sqlite*
+cookie_*.pickle
+debug
+ws.config
+temp*
+KB_exceptionAccounts.json
+*.xlsx
+
+# Virtual env / build outputs
+venv/
+.venv/
+dist/
+build/
+
+# Tooling/IDE/system folders
+.vscode/
+.sync/
+_SYNCAPP/
+old/
+Chrome/
+115/
+Thumbs.db

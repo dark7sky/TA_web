@@ -1,0 +1,23 @@
+# DB
+psycopg2-binary
+python-dotenv
+
+# Web scraping / automation
+selenium
+webdriver-manager
+chromedriver-autoinstaller
+beautifulsoup4
+
+# HTTP
+requests
+
+# Telegram bot
+python-telegram-bot==13.14
+
+# Excel
+openpyxl
+
+paramiko
+pywinauto
+websockets
+tqdm
