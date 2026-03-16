@@ -40,9 +40,9 @@ FILE_LAST_UPDATE    = ".last_update.pickle"
 FILE_LAST_UPDATE_BK = ".last_update_bk.pickle"
 FILE_KB_PICKLE      = "KB.pickle"
 FILE_KBSELF_PICKLE  = "KBself.pickle"
-FILE_MANUAL         = "manual.pickle"
 FILE_CREON          = "CREON.pickle"
 CREON_ACCOUNT_NUMBER = os.getenv("CREON_ACCOUNT_NUMBER")
+MANUAL_INPUTS_TABLE = "manual_inputs"
 EXCEPTION_BANKS_ENV = "EXCEPTION_BANKS"
 EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
 
@@ -292,6 +292,106 @@ def pickle_read(
     except Exception as e:
         return "ERROR", e
     accounts[accname] = {"balance": {tnow: lab}}
+    return accounts
+
+
+def _normalize_manual_key(raw_key: str) -> tuple[str, str | None]:
+    """Map manual input key names to account keys.
+
+    Returns:
+        ``(account_key, label)`` where *label* is optional suffix text.
+    """
+    key_aliases = {
+        # Keep backward compatibility with legacy mojibake keys.
+        "?⑸퉬": "lab_private",
+        "toss利앷텒": "toss",
+        "?異?": "debt",
+        "蹂댄뿕": "insurance",
+        # Human-readable aliases for DB-managed keys.
+        "여윳돈": "lab_private",
+        "toss증권": "toss",
+        "대출": "debt",
+        "보험": "insurance",
+    }
+
+    if "@" in raw_key:
+        parts = raw_key.split("@")
+        account_key = parts[0]
+        label = "".join(parts[1:])
+        account_key = key_aliases.get(account_key, account_key)
+        return account_key, label
+
+    return key_aliases.get(raw_key, raw_key), None
+
+
+def _parse_manual_value(raw_value: Any) -> int | None:
+    """Convert manual input value into integer when possible."""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        return int(raw_value)
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, float):
+        return int(raw_value)
+
+    text = str(raw_value).strip().replace(",", "")
+    if text == "":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
+
+def _apply_manual_inputs_from_db(cur: Any, tnow: str, accounts: dict) -> dict:
+    """Load manual inputs from PostgreSQL ``manual_inputs`` table.
+
+    The latest row per ``key_name`` is applied.
+    """
+    try:
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (key_name) key_name, value
+            FROM "{MANUAL_INPUTS_TABLE}"
+            ORDER BY key_name, updated_at DESC, id DESC
+            """
+        )
+    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable) as e:
+        log(f"{MANUAL_INPUTS_TABLE} table not ready: {e}")
+        return accounts
+    except Exception as e:
+        log(f"Failed reading {MANUAL_INPUTS_TABLE}: {e}")
+        return accounts
+
+    for raw_key, raw_value in cur.fetchall():
+        if raw_key is None:
+            log("Skip manual input with empty key_name")
+            continue
+
+        key_name = str(raw_key).strip()
+        if key_name == "":
+            log("Skip manual input with blank key_name")
+            continue
+
+        value = _parse_manual_value(raw_value)
+        if value is None:
+            log(f"Skip manual input with non-numeric value: {key_name}={raw_value}")
+            continue
+
+        accname, label = _normalize_manual_key(key_name)
+        if label is None:
+            log(f"=== manual input update: {accname} ===")
+        else:
+            log(f"=== manual input update: {accname} ({label}) ===")
+
+        if "@" in key_name and accname in accounts:
+            value += int(accounts[accname]["balance"][tnow])
+        accounts[accname] = {"balance": {tnow: value}}
+
     return accounts
 
 
@@ -821,34 +921,7 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
 
     # ?? 3. Manual / CREON entries ?????????????????????????????????????????
     try:
-        try:
-            with open(FILE_MANUAL, "rb") as f:
-                readResult = pickle.load(f)
-            for accname, value in readResult.items():
-                match accname:
-                    case "?⑸퉬":
-                        accname = "lab_private"
-                        log("=== ?⑸퉬 ?붽퀬 ?낅뜲?댄듃 ===")
-                    case "toss利앷텒":
-                        accname = "toss"
-                        log("=== ?좎벐利앷텒 ?붽퀬 ?낅뜲?댄듃 ===")
-                    case _ as accname2 if "@" in accname2:
-                        parts   = accname2.split("@")
-                        accname = parts[0]
-                        label   = "".join(parts[1:])
-                        if accname == "?異?":
-                            accname = "debt"
-                            log(f"=== ?異?({label}) ?낅뜲?댄듃 ===")
-                        elif accname == "蹂댄뿕":
-                            accname = "insurance"
-                            log(f"=== 蹂댄뿕 ({label}) ?낅뜲?댄듃 ===")
-                        else:
-                            log(f"=== {accname} ({label}) ?낅뜲?댄듃 ===")
-                        if accname in accounts:
-                            value += accounts[accname]["balance"][tnow]
-                accounts[accname] = {"balance": {tnow: value}}
-        except Exception as e:
-            log(f"manual.pickle 泥섎━ 以??먮윭: {e}")
+        accounts = _apply_manual_inputs_from_db(cur=cur, tnow=tnow, accounts=accounts)
 
         log("=== CREON ?붽퀬 ?낅뜲?댄듃 ===")
         if CREON_ACCOUNT_NUMBER in (None, ""):
@@ -971,4 +1044,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
     else:
         print("\n=== ?꾨즺 ===")
-
