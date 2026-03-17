@@ -12,10 +12,12 @@ import os
 import pickle
 import re
 import psycopg2
+import psycopg2.extras
 import os
 from dotenv import load_dotenv
 load_dotenv()
 from typing import Any, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
@@ -24,14 +26,16 @@ from logger import Logger
 
 debug_print = False
 supportCardVendors = {
-    "?좏븳": "shinhan",
-    "?쇱꽦": "samsung",
-    "?곕━": "woori",
-    "KB":   "KB",
-    "?섎굹": "hana"
+    "신한": "shinhan",
+    "삼성": "samsung",
+    "우리": "woori",
+    "KB": "KB",
+    "하나": "hana",
 }
 
 logs = Logger(os.path.basename(__file__).split(".")[0])
+CARD_ACCOUNT_KEY = "accounts_cards"
+CARD_SOURCE = "cards_excel"
 
 
 def log(msg: str) -> None:
@@ -39,6 +43,13 @@ def log(msg: str) -> None:
         print(msg)
     else:
         logs.msg(msg)
+
+
+def get_app_timezone() -> datetime.tzinfo:
+    try:
+        return ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Seoul"))
+    except ZoneInfoNotFoundError:
+        return datetime.timezone.utc
 
 
 def Analysis_row(vendor: str, year: int, day_column: int, row: tuple) -> bool:
@@ -161,15 +172,15 @@ def Analysis_sheet(
 def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]:
     """Drive analysis constraints (columns, time formats) per vendor."""
     print(f", {sheetname}", end="", flush=True)
-    
+
     try:
         prefix = sheetname[0:2]
         vendor = supportCardVendors[prefix]
         year = 2000 + int(sheetname[-4:-2])
-    except KeyError as e:
-        return "ERROR", Exception(f"吏?먮릺吏 ?딅뒗 移대뱶 ?묐몢?? {prefix}")
+    except KeyError:
+        return "ERROR", Exception(f"Unsupported vendor prefix: {prefix}")
     except ValueError as e:
-        return "ERROR", Exception(f"Sheet ?대쫫 ?곕룄 ?뚯떛 ?먮윭({sheetname}): {e}")
+        return "ERROR", Exception(f"Invalid sheet date in {sheetname}: {e}")
 
     day_column = 0
     value_column = 0
@@ -178,43 +189,32 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
     fn_tick = datetime.datetime.now()
 
     if vendor == "shinhan":
-        first_id = str(ws["A1"].value)
-        if "?댁슜?쇱옄蹂?移대뱶?ъ슜?댁뿭" in first_id:
-            # ?붾퀎 ?湲?紐낆꽭??
+        first_id = str(ws["A1"].value).strip()
+        if first_id == "거래일":
             day_column = 0
-            value_column = 6
-            vendor_type = "1"
-            time_format = "%Y.%m.%d"
-            try:
-                fn_tick = datetime.datetime.strptime(str(ws["C4"].value), time_format)
-                fn_tick = fn_tick.replace(day=14, hour=17, minute=42, second=0)
-            except Exception as e:
-                logs.warning(f"Shinhan fn_tick fallback: {e}")
-                
-        elif "?댁슜?쇱떆" in first_id:
-            # ?뱀씤 ?댁뿭
-            day_column = 0
-            value_column = 6
+            value_column = 5
             vendor_type = "2"
-            time_format = "%Y%m%d%H%M%S"
-            total_day_val = str(ws["A2"].value)
-            
+            time_format = "%Y.%m.%d %H:%M"
+            total_day_val = str(ws["A2"].value).strip()
+
             try:
                 fn_tick = datetime.datetime.strptime(total_day_val, time_format)
             except ValueError:
                 try:
-                    fn_tick = datetime.datetime.strptime(total_day_val, "%Y/%m/%d  %H:%M")
-                    time_format = "%Y/%m/%d  %H:%M"
+                    fn_tick = datetime.datetime.strptime(total_day_val, "%Y.%m.%d %H:%M:%S")
+                    time_format = "%Y.%m.%d %H:%M:%S"
                 except ValueError:
-                    try:
-                        fn_tick = datetime.datetime.strptime(total_day_val, "%Y%m%d")
-                        time_format = "%Y%m%d"
-                    except ValueError:
-                        logs.warning(f"Shinhan date parse failed on {total_day_val}")
-                        fn_tick = datetime.datetime.now()
-            
+                    logs.warning(f"Shinhan date parse failed on {total_day_val}")
+                    fn_tick = datetime.datetime.now().replace(
+                        year=year,
+                        month=int(sheetname[-2:]),
+                        day=13,
+                        hour=17,
+                        minute=42,
+                        second=0,
+                    )
+
             temp_month = fn_tick.month
-            # Advance to first day of next month
             while temp_month == fn_tick.month:
                 fn_tick += datetime.timedelta(days=1)
             fn_tick = fn_tick.replace(day=14, hour=17, minute=42, second=0)
@@ -227,30 +227,21 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
         try:
             val = str(ws["L2"].value).strip()
             if val == "":
-                datetime.datetime.now().replace(year=year, month=int(sheetname[-2:]), day=13, hour=18, minute=3, second=0) 
-            else: fn_tick = datetime.datetime.strptime(val, "%Y%m%d").replace(hour=18, minute=3, second=0)
+                fn_tick = datetime.datetime.now().replace(
+                    year=year, month=int(sheetname[-2:]), day=13, hour=18, minute=3, second=0
+                )
+            else:
+                fn_tick = datetime.datetime.strptime(val, "%Y%m%d").replace(hour=18, minute=3, second=0)
         except Exception as e:
             logs.warning(f"Samsung total_day parse fail: {e}")
 
     elif vendor == "KB":
-        if str(ws["T7"].value).strip() == "?뱀씤踰덊샇":
-            total_col = "S"
-            value_column = 7
-            vendor_type = "4"
-            temp_day = 0
-        elif str(ws["F9"].value).strip() == "?댁슜湲덉븸":
-            total_col = "M"
-            value_column = 5
-            vendor_type = "6"
-            temp_day = 10
-        else:
-            total_col = "M"
-            value_column = 5
-            vendor_type = "5"
-            temp_day = 1
-            
+        total_col = "M"
+        value_column = 5
+        vendor_type = "5"
         day_column = 0
         time_format = "%Y-%m-%d"
+        temp_day = 1
         max_search = 100
         while max_search > 0:
             val = ws[f"{total_col}{temp_day}"].value
@@ -270,7 +261,7 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
         vendor_type = "3"
         time_format = "%Y.%m.%d %H:%M:%S"
         temp_day = 1
-        
+
         while True:
             val = ws[f"{total_col}{temp_day}"].value
             if val is not None:
@@ -279,7 +270,7 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
                     break
                 except ValueError:
                     pass
-                    
+
             temp_day += 1
             if temp_day > 10:
                 if total_col == "J":
@@ -290,14 +281,10 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
                 value_column = 7
 
     elif vendor == "hana":
-        try:
-            month = int(sheetname[-2:])
-        except ValueError:
-            month = 1
-            
+        month = int(sheetname[-2:])
         the_day = datetime.date(year=year, month=month, day=28) + datetime.timedelta(weeks=1)
         the_day = the_day.replace(day=13)
-        
+
         day_column = 0
         value_column = 5
         vendor_type = "4"
@@ -442,18 +429,6 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
         logs.error(err_msg)
         raise ValueError("totals have to be 0")
 
-    # DB Write
-    try:
-        cur.execute("SELECT date FROM accounts_cards LIMIT 1")
-        cur.execute("DELETE FROM accounts_cards")
-    except psycopg2.OperationalError:
-        cur.execute(
-            "CREATE TABLE accounts_cards (date TEXT, balance INTEGER, PRIMARY KEY(date))"
-        )
-
-    # Use normalized portfolio history when available and fall back to the
-    # legacy summary table during the transition.
-    min_max = None
     try:
         cur.execute(
             "SELECT min(recorded_at), max(recorded_at) FROM portfolio_balance_history"
@@ -463,34 +438,44 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
         min_max = None
 
     if min_max and min_max[0]:
-        start = min_max[0]
-        end = min_max[1]
+        tz = get_app_timezone()
+        start = min_max[0].astimezone(tz)
+        end = min_max[1].astimezone(tz)
     else:
-        try:
-            cur.execute("SELECT min(date), max(date) FROM accounts_balance")
-            min_max = cur.fetchone()
-            if min_max and min_max[0]:
-                start = datetime.datetime.strptime(min_max[0], "%Y-%m-%d %H:%M:%S")
-                end = datetime.datetime.strptime(min_max[1], "%Y-%m-%d %H:%M:%S")
-            else:
-                logs.warning("No balance history found; skipping accounts_cards insert.")
-                return
-        except Exception:
-            logs.warning("No balance history table found; skipping accounts_cards insert.")
-            return
+        logs.warning("No normalized balance history found; skipping accounts_cards insert.")
+        return
+
+    cur.execute(
+        """
+        INSERT INTO accounts (
+            account_key, company, type, name, memo, is_special, is_active
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (account_key) DO UPDATE SET
+            company = EXCLUDED.company,
+            type = EXCLUDED.type,
+            name = EXCLUDED.name,
+            memo = EXCLUDED.memo,
+            is_special = EXCLUDED.is_special,
+            is_active = EXCLUDED.is_active,
+            updated_at = now()
+        """,
+        (CARD_ACCOUNT_KEY, CARD_ACCOUNT_KEY, "Special", CARD_ACCOUNT_KEY, "", True, True),
+    )
+    cur.execute("DELETE FROM account_balance_history WHERE account_key = %s", (CARD_ACCOUNT_KEY,))
 
     insert_rows = []
     prev = 0
     for n, row_data in enumerate(datas):
         tick, amt = row_data[0], row_data[1]
         prev += amt
+        tick_local = tick.replace(tzinfo=tz)
 
-        if tick < start:
+        if tick_local < start:
             continue
-        if tick > end:
+        if tick_local > end:
             break
 
-        insert_rows.append((tick.strftime("%Y-%m-%d %H:%M:%S"), prev))
+        insert_rows.append((CARD_ACCOUNT_KEY, tick_local.astimezone(datetime.timezone.utc), prev, CARD_SOURCE))
         if n % 50 == 0:
             print(".", end="", flush=True)
 
@@ -498,10 +483,16 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
         print("[Start] Executing DB", flush=True)
         psycopg2.extras.execute_values(
             cur,
-            "INSERT INTO accounts_cards (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING",
-            insert_rows
+            """
+            INSERT INTO account_balance_history (account_key, recorded_at, balance, source)
+            VALUES %s
+            ON CONFLICT (account_key, recorded_at) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                source = EXCLUDED.source
+            """,
+            insert_rows,
         )
-    print(f"\n[accounts_cards] {len(insert_rows)}嫄??쎌엯 ?꾨즺", flush=True)
+    print(f"\n[accounts_cards] {len(insert_rows)} normalized rows inserted", flush=True)
 
     # Auto-cleanup old sheets
     if delSheetList:

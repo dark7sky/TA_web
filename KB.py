@@ -412,7 +412,13 @@ def should_refresh_cards(last_update: dict[str, float]) -> bool:
 def fetch_latest_card_balance(cur: Any) -> int:
     try:
         cur.execute(
-            "SELECT balance FROM accounts_cards ORDER BY date DESC LIMIT 1"
+            """
+            SELECT balance
+            FROM account_balance_history
+            WHERE account_key = 'accounts_cards'
+            ORDER BY recorded_at DESC
+            LIMIT 1
+            """
         )
         row = cur.fetchone()
         if row is None or row[0] is None:
