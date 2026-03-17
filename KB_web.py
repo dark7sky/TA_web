@@ -851,12 +851,12 @@ def main():
         # time_sleep_update_min(__name__, 0)
         # os.system(".\\dist\\KB.exe")
         # KB.KB_main()
-        
+        print("Start update Process")
         repo = git.Repo("https://github.com/dark7sky/TA_web.git")
         origin = repo.remotes.origin
         info=origin.pull()
         for item in info:
-            print(f"Updated {item.ref} to {item.comit}")
+            print(f"Updated {item.ref} to {item.commit}")
 
         os.system(".\\venv\\Scripts\\python.exe KB.py")
         # time_sleep_update_min(__name__, 0)
