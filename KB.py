@@ -57,7 +57,7 @@ NON_ACCOUNT_TABLES = {
     "system_settings",
 }
 
-filepath_cardexcel  = "移대뱶?듯빀.xlsx"
+filepath_cardexcel  = "카드통합.xlsx"
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -255,16 +255,16 @@ def kbstock(tnow: str, accounts: dict) -> dict | tuple[str, Exception]:
                 accounts[accnum]["balance"][tnow] = balance
             else:
                 accounts[accnum] = {
-                    "company": "KB利앷텒",
-                    "type":    "醫낇빀?꾪긽",
-                    "name":    "KB二쇱떇?ъ옄怨꾩쥖",
+                    "company": "KB증권",
+                    "type":    "종합위탁",
+                    "name":    "KB주식투자계좌",
                     "balance": {tnow: balance},
                 }
     except FileNotFoundError:
-        log("KBself.pickle not found ??skipping KB-securities.")
+        log("KBself.pickle not found// skipping KB-securities.")
     except Exception as e:
         return "ERROR", e
-    log("=== KB 利앷텒 update ===")
+    log("=== KB 증권 update ===")
     return accounts
 
 
@@ -302,13 +302,7 @@ def _normalize_manual_key(raw_key: str) -> tuple[str, str | None]:
         ``(account_key, label)`` where *label* is optional suffix text.
     """
     key_aliases = {
-        # Keep backward compatibility with legacy mojibake keys.
-        "?⑸퉬": "lab_private",
-        "toss利앷텒": "toss",
-        "?異?": "debt",
-        "蹂댄뿕": "insurance",
-        # Human-readable aliases for DB-managed keys.
-        "여윳돈": "lab_private",
+        "랩비": "lab_private",
         "toss증권": "toss",
         "대출": "debt",
         "보험": "insurance",
@@ -414,11 +408,11 @@ def cards_to_accounts(
     Returns:
         Updated accounts dict or ``("ERROR", exc)``.
     """
-    log("=== 移대뱶 寃곗젣 ?붽퀬 ?낅뜲?댄듃 ===")
+    log("=== 카드 잔액 ===")
     try:
         cards.main(cur, filepath_exel=filepath_cardexcel)
     except Exception as e:
-        log(f"cards.main ?먮윭: {e}")
+        log(f"cards.main 에러: {e}")
         return "ERROR", e
 
     cur.execute(
@@ -620,7 +614,7 @@ def accounts_balance_update(cur: Any, accounts: dict) -> None:
                 diff_insert_data
             )
     except Exception as e:
-        log(f"Accounts 醫낇빀 ?낅뜲?댄듃 ?ㅽ뙣: {e}")
+        log(f"Accounts  종합 업데이트 실패: {e}")
         raise
 
 
@@ -895,40 +889,41 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
     global db_con
 
     # ?? 1. Prepare shared variables ??????????????????????????????????????
-    log("=== 珥덇린 蹂??以鍮?===")
+    log("=== 초기 변수 준비===")
     try:
         tnow, last_update, exceptions = KB_prepare()
     except Exception as e:
         return "ERROR", e
 
     # ?? 2. KB open-banking & securities ??????????????????????????????????
-    log("=== KB 利앷텒 ?ㅽ뵂諭낇궧/怨꾩쥖 ?낅뜲?댄듃 ===")
+    log("=== KB 증권 오픈뱅킹/계좌 업데이트 ===")
     try:
         if os.path.isfile(FILE_KB_PICKLE):
             last_update["KB"] = os.path.getmtime(FILE_KB_PICKLE)
         else:
             raise FileNotFoundError(f"{FILE_KB_PICKLE} is missing")
 
-        log("=== KB.pickle 遺꾩꽍 ===")
+        log("=== KB.pickle 분석 ===")
         accounts = kbstock_openbank(tnow, exceptions)
         if not isinstance(accounts, dict):
-            raise Exception("KB利앷텒-?ㅽ뵂諭낇궧 寃곌낵 媛??먮윭")
+            raise Exception("KB증권-오픈뱅킹 결과 값 에러")
         accounts = kbstock(tnow, accounts)
         if not isinstance(accounts, dict):
-            raise Exception("KB利앷텒-利앷텒怨꾩쥖 寃곌낵 媛??먮윭")
+            raise Exception("KB증권-오픈뱅킹 결과 값 에러")
     except Exception as e:
         return "ERROR", e
 
     # ?? 3. Manual / CREON entries ?????????????????????????????????????????
     try:
+        log("manual input DB 처리")
         accounts = _apply_manual_inputs_from_db(cur=cur, tnow=tnow, accounts=accounts)
 
-        log("=== CREON ?붽퀬 ?낅뜲?댄듃 ===")
+        log("=== CREON 잔고 업데이트 ===")
         if CREON_ACCOUNT_NUMBER in (None, ""):
             raise ValueError("CREON_ACCOUNT_NUMBER is missing in .env")
         accounts = pickle_read(tnow, accounts, fp=FILE_CREON, accname=CREON_ACCOUNT_NUMBER)
         if not isinstance(accounts, dict):
-            raise Exception("CREON ?낅뜲?댄듃 ?먮윭")
+            raise Exception("CREON 업데이트 에")
     except Exception as e:
         return "ERROR", e
 
@@ -938,11 +933,11 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
             acc_data["balance"][max(acc_data["balance"])]
             for acc_data in accounts.values()
         )
-        log(f"占?{totals:,}")
+        log(f"총액: {totals:,}")
         if totals <= 150_000_000:
-            raise ValueError("珥앺빀 1??5泥쒕쭔??誘몃쭔 ???곗씠???ㅻ쪟濡??먮떒?섍퀬 醫낅즺?⑸땲??")
+            raise ValueError("15천만원 미만 결과는 뭔가 문제가 있다고 생각됨")
     except Exception as e:
-        e.add_note("遺꾩꽍 寃곌낵 1??5泥쒕쭔??誘몃쭔 => 臾몄젣 ?덈떎怨??먮떒?섍퀬 醫낅즺")
+        e.add_note("분석 결과 150,000,000 미만 => 문제 있다고 판단하고 종료")
         return "ERROR", e
 
     # ?? 5. Card debt  ?????????????????????????????????????????????????????
@@ -960,16 +955,16 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
         if go_analysis_card:
             accounts = cards_to_accounts(tnow=tnow, accounts=accounts)
             if not isinstance(accounts, dict):
-                raise Exception("移대뱶 ?낅뜲?댄듃 ?먮윭")
+                raise Exception("카드 업데이트 에러")
             last_update["cards"] = os.path.getmtime(filepath_cardexcel)
         else:
-            log("移대뱶 excel 蹂???놁쓬")
+            log("카드 excel 파일이 없음")
             last_card(tnow=tnow, accounts=accounts)
     except Exception as e:
         return "ERROR", e
 
     # ?? 6. Write account info ?????????????????????????????????????????????
-    log("=== 怨꾩쥖 ?뺣낫 ?낅뜲?댄듃 ===")
+    log("=== 계좌 정보 업데이트 ===")
     try:
         info_update(accounts=accounts)
     except Exception as e:
@@ -986,45 +981,45 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
     }
 
     # ?? 8. Per-account balance update ?????????????????????????????????????
-    log("=== 怨꾩쥖 ?붽퀬 ?낅뜲?댄듃 ===")
+    log("=== 계좌 잔고 업데이트 ===")
     balance_update(accounts=accounts, tnow=tnow, exceptions=exceptions)
 
     # ?? 9. Total balance update ???????????????????????????????????????????
     try:
         if not go_analysis_card:
-            log("=== 醫낇빀?붽퀬 ?낅뜲?댄듃 ===")
-            print("=== 醫낇빀?붽퀬 ?낅뜲?댄듃 ===", flush=True)
+            log("=== 종합잔고 업데이트 ===")
+            # print("=== 종합잔고 업데이트 ===", flush=True)
             accounts_balance_update(accounts=accounts)
         else:
-            log("=== 醫낇빀?붽퀬 ?꾩껜 媛깆떊 ===")
-            print("=== 醫낇빀?붽퀬 ?꾩껜 媛깆떊 ===", flush=True)
+            log("=== 종합잔고 전체 갱신 ===")
+            # print("=== 醫낇빀?붽퀬 ?꾩껜 媛깆떊 ===", flush=True)
             refresh_accounts_balance()
     except Exception as e:
-        print(f"[ERROR] 醫낇빀?붽퀬 ?낅뜲?댄듃 ?ㅽ뙣: {e!r}", flush=True)
+        print(f"[ERROR] 종합잔고 갱신 실패: {e!r}", flush=True)
         return "ERROR", e
 
     # ?? 10. Daily / monthly diff ??????????????????????????????????????????
-    log("=== ?붽퀬 ?쇰퀎/?붾퀎 蹂???낅뜲?댄듃 ===")
-    print("=== ?붽퀬 ?쇰퀎/?붾퀎 蹂???낅뜲?댄듃 ===", flush=True)
+    log("=== 잔고 일별/월별 변동 업데이트 ===")
+    # print("=== ?붽퀬 ?쇰퀎/?붾퀎 蹂???낅뜲?댄듃 ===", flush=True)
     try:
         refresh_daydiff()
         refresh_monthdiff()
     except Exception as e:
-        print(f"[ERROR] ????diff ?낅뜲?댄듃 ?ㅽ뙣: {e!r}", flush=True)
+        print(f"[ERROR] 잔고 일별/월별 변동 업데이트 실패: {e!r}", flush=True)
         return "ERROR", e
 
     # ?? 11. Deduplicate ???????????????????????????????????????????????????
-    log("=== 以묐났?쒓굅 ===")
-    print("=== 以묐났?쒓굅 ===", flush=True)
+    log("=== 중복제거 ===")
+    # print("=== 以묐났?쒓귗 ===", flush=True)
     try:
         duplicated_remover()
     except Exception as e:
-        print(f"[ERROR] 以묐났?쒓굅 ?ㅽ뙣: {e!r}", flush=True)
+        print(f"[ERROR] 중복제거 실패: {e!r}", flush=True)
         return "ERROR", e
 
     # ?? 12. Persist last_update & commit ??????????????????????????????????
     if not lst_udt(operation="save", last_update=last_update):
-        raise Exception(".last_update.pickle ????먮윭")
+        raise Exception(".last_update.pickle 저장 실패")
 
     try:
         cur.close()
@@ -1032,7 +1027,7 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
         db_con.close()    # type: ignore[union-attr]
         db_con = None
     except Exception as e:
-        log(f"DB ????ㅻ쪟: {e}")
+        log(f"DB 저장 실패: {e}")
 
     return True
 
@@ -1040,7 +1035,7 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
 if __name__ == "__main__":
     result = KB_main()
     if isinstance(result, tuple) and result[0] == "ERROR":
-        print(f"\n[ERROR] KB_main ?ㅽ뙣: {result[1]!r}")
+        print(f"\n[ERROR] KB_main 실패: {result[1]!r}")
         raise SystemExit(1)
     else:
-        print("\n=== ?꾨즺 ===")
+        print("\n=== 종료 ===")
