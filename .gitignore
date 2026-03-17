@@ -32,6 +32,12 @@ debug
 !client.py
 !Focus_window.py
 !keys_qmenu.py
+!normalized_pg.py
+!ysfunc.py
+!find_pennies.py
+!grapher.py
+!migrate_db.py
+!sqlite3_to_influxed.py
 
 # Python cache
 __pycache__/
