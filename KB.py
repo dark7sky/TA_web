@@ -1,31 +1,24 @@
-﻿"""KB.py Total Account Tracker
-Fetches and persists account balances from KB banking/securities pickles,
-manual entries, card data, and CREON, into a local PostgreSQL database.
+from __future__ import annotations
 
-Last modified: 2026-03-17 (optimized)
-"""
+import datetime as dt
 import os
-import cards
 import pickle
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import cards
 import psycopg2
 import psycopg2.extras
-import io
-import csv
-from typing import Any
 from dotenv import load_dotenv
-load_dotenv()
-import datetime
-import functools
-from typing import Callable, Any, Dict, Optional, Tuple, Iterable
-
 from tqdm import tqdm
-from KB_web import all_datas
-import logger
 
-print("Last modified: 2026-03-17 with Antigravity - Gemini 3.1 Pro")
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+import logger
+from KB_web import all_datas
+
+load_dotenv()
+
 logs = logger.logger(os.path.basename(__file__).split(".")[0])
 
 
@@ -33,51 +26,47 @@ def log(msg: str) -> None:
     logs.msg(msg)
 
 
-# ---------------------------------------------------------------------------
-# File / path constants
-# ---------------------------------------------------------------------------
-FILE_LAST_UPDATE    = ".last_update.pickle"
+FILE_LAST_UPDATE = ".last_update.pickle"
 FILE_LAST_UPDATE_BK = ".last_update_bk.pickle"
-FILE_KB_PICKLE      = "KB.pickle"
-FILE_KBSELF_PICKLE  = "KBself.pickle"
-FILE_CREON          = "CREON.pickle"
-CREON_ACCOUNT_NUMBER = os.getenv("CREON_ACCOUNT_NUMBER")
+FILE_KB_PICKLE = "KB.pickle"
+FILE_KBSELF_PICKLE = "KBself.pickle"
+FILE_CREON = "CREON.pickle"
+FILE_CARD_PICKLE = "cards.pickle"
+FILE_CARD_EXCEL = "카드통합.xlsx"
 MANUAL_INPUTS_TABLE = "manual_inputs"
+APP_TIMEZONE_ENV = "APP_TIMEZONE"
+CREON_ACCOUNT_NUMBER = os.getenv("CREON_ACCOUNT_NUMBER")
 EXCEPTION_BANKS_ENV = "EXCEPTION_BANKS"
 EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
-
-# Tables that are not per-account ledgers.
-NON_ACCOUNT_TABLES = {
-    "accounts_balance",
-    "accounts_daydiff",
-    "accounts_diff",
-    "accounts_info",
-    "accounts_monthdiff",
-    "manual_inputs",
-    "system_settings",
+USE_TQDM = True
+KNOWN_SPECIAL_KEYS = {
+    "accounts_cards",
+    "toss",
+    "debt",
+    "insurance",
+    "lab_private",
+    "외화",
+    "지역화폐",
+    "장기수선충당금",
 }
 
-filepath_cardexcel  = "카드통합.xlsx"
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-Accounts   = Dict[str, Dict[str, Any]]
-StepResult = Tuple[str, Exception]
+@dataclass
+class AccountSnapshot:
+    account_key: str
+    balance: int
+    company: str = ""
+    account_type: str = ""
+    name: str = ""
+    memo: str = ""
+    is_special: bool = False
+    source: str = "kb"
 
-# ---------------------------------------------------------------------------
-# Global DB connection (managed by db_decorator)
-# ---------------------------------------------------------------------------
-db_con: Optional[Any] = None
 
-USE_TQDM = True
+Accounts = dict[str, AccountSnapshot]
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-def progress_iter(iterable: Iterable, desc: str = "") -> Iterable:
-    """Wrap *iterable* with tqdm when USE_TQDM is True."""
+def progress_iter(iterable: Any, desc: str = "") -> Any:
     return tqdm(iterable, desc=desc) if USE_TQDM else iterable
 
 
@@ -86,6 +75,17 @@ def required_env(key: str) -> str:
     if value in (None, ""):
         raise RuntimeError(f"Required env var missing: {key}")
     return value
+
+
+def get_app_timezone() -> ZoneInfo | dt.timezone:
+    try:
+        return ZoneInfo(os.getenv(APP_TIMEZONE_ENV, "Asia/Seoul"))
+    except ZoneInfoNotFoundError:
+        return dt.timezone.utc
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now(get_app_timezone())
 
 
 def parse_env_csv(key: str) -> list[str]:
@@ -102,1015 +102,657 @@ def load_exceptions() -> dict[str, list[str]]:
     }
 
 
-def lst_udt(
-    operation: str = "read",
-    last_update: Optional[Dict[str, float]] = None,
-) -> Dict[str, float] | bool:
-    """Read or save `.last_update.pickle`.
-
-    Args:
-        operation: ``"read"`` (default) or ``"save"``.
-        last_update: Dict to persist when *operation* is ``"save"``.
-
-    Returns:
-        dict on read, bool on save.
-    """
-    if last_update is None:
-        last_update = {}
-
+def lst_udt(operation: str = "read", last_update: dict[str, float] | None = None) -> dict[str, float] | bool:
+    last_update = last_update or {}
     if operation == "read":
         try:
-            with open(FILE_LAST_UPDATE, "rb") as f:
-                return pickle.load(f)
+            with open(FILE_LAST_UPDATE, "rb") as file_obj:
+                return pickle.load(file_obj)
         except FileNotFoundError:
-            log(f"{FILE_LAST_UPDATE} not found ??using default.")
-            return {"KB": float(0)}
+            log(f"{FILE_LAST_UPDATE} not found; using defaults.")
+            return {"KB": 0.0}
         except pickle.UnpicklingError:
-            log(f"{FILE_LAST_UPDATE} corrupt ??loading backup.")
-            with open(FILE_LAST_UPDATE_BK, "rb") as f:
-                return pickle.load(f)
+            log(f"{FILE_LAST_UPDATE} is corrupt; loading backup.")
+            with open(FILE_LAST_UPDATE_BK, "rb") as file_obj:
+                return pickle.load(file_obj)
 
-    elif operation == "save":
+    if operation == "save":
         try:
-            with open(FILE_LAST_UPDATE, "wb") as f:
-                pickle.dump(last_update, f)
+            with open(FILE_LAST_UPDATE, "wb") as file_obj:
+                pickle.dump(last_update, file_obj)
             return True
-        except Exception as e:
-            log(f"Error saving {FILE_LAST_UPDATE}: {e}")
+        except Exception as exc:
+            log(f"Error saving {FILE_LAST_UPDATE}: {exc}")
             return False
 
     return False
 
 
-# ---------------------------------------------------------------------------
-# Database decorator
-# ---------------------------------------------------------------------------
-
-def db_decorator():
-    """Decorator factory: opens (or reuses) a global SQLite cursor and
-    injects it as *cur* keyword argument into the wrapped function."""
-    global db_con
-    if db_con is None:
-        db_con = psycopg2.connect(
-            host=required_env("DB_HOST"),
-            database=required_env("DB_NAME"),
-            user=required_env("DB_USER"),
-            password=required_env("DB_PASSWORD"),
-            port=os.getenv("DB_PORT", "5432"),
-            sslmode='disable'
-        )
-        db_con.set_session(autocommit=True)
-    try:
-        cur = db_con.cursor()
-    except Exception:
-        db_con = psycopg2.connect(
-            host=required_env("DB_HOST"),
-            database=required_env("DB_NAME"),
-            user=required_env("DB_USER"),
-            password=required_env("DB_PASSWORD"),
-            port=os.getenv("DB_PORT", "5432"),
-            sslmode='disable'
-        )
-        db_con.set_session(autocommit=True)
-        cur = db_con.cursor()
-
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            return func(*args, cur=cur, **kwargs)
-        return wrapper
-    return decorator
-
-
-# ---------------------------------------------------------------------------
-# Step functions
-# ---------------------------------------------------------------------------
-
-@logger.with_logging(logs)
-def KB_prepare() -> tuple[str, dict[str, float], dict] | tuple[str, Exception]:
-    """Prepare *tnow*, *last_update*, and *exceptions*.
-
-    Returns:
-        ``(tnow, last_update, exceptions)`` or ``("ERROR", exc)``.
-    """
-    try:
-        tnow = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        last_update = lst_udt(operation="read")
-        exceptions = load_exceptions()
-        return tnow, last_update, exceptions
-    except Exception as e:
-        return "ERROR", e
-
-
-@logger.with_logging(logs)
-def kbstock_openbank(tnow: str, exceptions: dict) -> dict | tuple[str, Exception]:
-    """Parse ``KB.pickle`` (open-banking data) and build *accounts* dict.
-
-    Args:
-        tnow: Timestamp string for this run.
-        exceptions: Banks/accounts to skip.
-
-    Returns:
-        accounts dict or ``("ERROR", exc)``.
-    """
-    accounts: dict = {}
-    try:
-        with open(FILE_KB_PICKLE, "rb") as f:
-            lines = pickle.load(f)
-        for line in lines:
-            if line[0] in exceptions.get("bank", []):
-                continue
-            if line[2] in exceptions.get("accounts", []):
-                continue
-            accounts[line[2]] = {
-                "company": line[0],
-                "type":    line[1],
-                "name":    line[3],
-                "balance": {tnow: line[4]},
-            }
-    except Exception as e:
-        return "ERROR", e
-    return accounts
-
-
-@logger.with_logging(logs)
-def kbstock(tnow: str, accounts: dict) -> dict | tuple[str, Exception]:
-    """Merge KB-securities balances from ``KBself.pickle`` into *accounts*.
-
-    Args:
-        tnow: Timestamp string for this run.
-        accounts: Existing accounts dict.
-
-    Returns:
-        Updated accounts dict or ``("ERROR", exc)``.
-    """
-    try:
-        with open(FILE_KBSELF_PICKLE, "rb") as f:
-            kbselfresult = pickle.load(f)
-        for accnum in all_datas["KBaccounts"]:
-            balance = kbselfresult.get(accnum, 0)
-            if balance == 0:
-                log(f"KB-stock account not found ({accnum})")
-            if accnum in accounts:
-                accounts[accnum]["balance"][tnow] = balance
-            else:
-                accounts[accnum] = {
-                    "company": "KB증권",
-                    "type":    "종합위탁",
-                    "name":    "KB주식투자계좌",
-                    "balance": {tnow: balance},
-                }
-    except FileNotFoundError:
-        log("KBself.pickle not found// skipping KB-securities.")
-    except Exception as e:
-        return "ERROR", e
-    log("=== KB 증권 update ===")
-    return accounts
-
-
-@logger.with_logging(logs)
-def pickle_read(
-    tnow: str, accounts: dict, fp: str, accname: str
-) -> dict | tuple[str, Exception]:
-    """Read a single-value pickle and store it as an account balance.
-
-    Args:
-        tnow: Timestamp string for this run.
-        accounts: Existing accounts dict.
-        fp: Path to the pickle file.
-        accname: Key to use in *accounts*.
-
-    Returns:
-        Updated accounts dict or ``("ERROR", exc)``.
-    """
-    try:
-        with open(fp, "rb") as f:
-            lab = int(pickle.load(f))
-    except FileNotFoundError:
-        log(f"{fp} not found ??defaulting to 0.")
-        lab = 0
-    except Exception as e:
-        return "ERROR", e
-    accounts[accname] = {"balance": {tnow: lab}}
-    return accounts
-
-
-def _normalize_manual_key(raw_key: str) -> tuple[str, str | None]:
-    """Map manual input key names to account keys.
-
-    Returns:
-        ``(account_key, label)`` where *label* is optional suffix text.
-    """
-    key_aliases = {
-        "랩비": "lab_private",
-        "toss증권": "toss",
-        "대출": "debt",
-        "보험": "insurance",
-    }
-
-    if "@" in raw_key:
-        parts = raw_key.split("@")
-        account_key = parts[0]
-        label = "".join(parts[1:])
-        account_key = key_aliases.get(account_key, account_key)
-        return account_key, label
-
-    return key_aliases.get(raw_key, raw_key), None
-
-
-def _parse_manual_value(raw_value: Any) -> int | None:
-    """Convert manual input value into integer when possible."""
+def parse_int_value(raw_value: Any) -> int | None:
     if raw_value is None:
         return None
     if isinstance(raw_value, bool):
         return int(raw_value)
     if isinstance(raw_value, int):
         return raw_value
+    if isinstance(raw_value, Decimal):
+        return int(raw_value)
     if isinstance(raw_value, float):
         return int(raw_value)
 
-    text = str(raw_value).strip().replace(",", "")
-    if text == "":
+    text_value = str(raw_value).strip().replace(",", "")
+    if text_value == "":
         return None
     try:
-        return int(text)
+        return int(text_value)
     except ValueError:
         try:
-            return int(float(text))
+            return int(float(text_value))
         except ValueError:
             return None
 
 
-def _apply_manual_inputs_from_db(cur: Any, tnow: str, accounts: dict) -> dict:
-    """Load manual inputs from PostgreSQL ``manual_inputs`` table.
+def get_db_connection() -> Any:
+    return psycopg2.connect(
+        host=required_env("DB_HOST"),
+        database=required_env("DB_NAME"),
+        user=required_env("DB_USER"),
+        password=required_env("DB_PASSWORD"),
+        port=os.getenv("DB_PORT", "5432"),
+        sslmode="disable",
+    )
 
-    The latest row per ``key_name`` is applied.
-    """
+
+def ensure_normalized_schema(cur: Any) -> None:
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_key TEXT PRIMARY KEY,
+            company TEXT,
+            type TEXT,
+            name TEXT,
+            memo TEXT NOT NULL DEFAULT '',
+            is_special BOOLEAN NOT NULL DEFAULT FALSE,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS account_balance_history (
+            account_key TEXT NOT NULL REFERENCES accounts(account_key) ON DELETE CASCADE,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            balance BIGINT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (account_key, recorded_at)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS portfolio_balance_history (
+            recorded_at TIMESTAMPTZ PRIMARY KEY,
+            balance BIGINT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS portfolio_daydiff (
+            balance_date DATE PRIMARY KEY,
+            balance BIGINT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS portfolio_monthdiff (
+            balance_date DATE PRIMARY KEY,
+            balance BIGINT NOT NULL
+        )
+        """,
+        'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_account_recorded_at" ON "account_balance_history" ("account_key", "recorded_at" DESC)',
+        'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_recorded_at" ON "account_balance_history" ("recorded_at" DESC)',
+        'CREATE INDEX IF NOT EXISTS "idx_portfolio_balance_history_recorded_at" ON "portfolio_balance_history" ("recorded_at" DESC)',
+        'CREATE INDEX IF NOT EXISTS "idx_portfolio_daydiff_balance_date" ON "portfolio_daydiff" ("balance_date" DESC)',
+        'CREATE INDEX IF NOT EXISTS "idx_portfolio_monthdiff_balance_date" ON "portfolio_monthdiff" ("balance_date" DESC)',
+    ]
+    for statement in statements:
+        cur.execute(statement)
+
+
+def merge_snapshot(accounts: Accounts, snapshot: AccountSnapshot, additive: bool = False) -> None:
+    existing = accounts.get(snapshot.account_key)
+    if existing is None:
+        if not snapshot.name:
+            snapshot.name = snapshot.account_key
+        accounts[snapshot.account_key] = snapshot
+        return
+
+    if snapshot.company:
+        existing.company = snapshot.company
+    if snapshot.account_type:
+        existing.account_type = snapshot.account_type
+    if snapshot.name:
+        existing.name = snapshot.name
+    if snapshot.memo:
+        existing.memo = snapshot.memo
+    existing.is_special = existing.is_special or snapshot.is_special
+    if additive:
+        existing.balance += snapshot.balance
+    else:
+        existing.balance = snapshot.balance
+    if snapshot.source:
+        existing.source = snapshot.source
+
+
+def normalize_manual_key(raw_key: str) -> tuple[str, str | None]:
+    key_aliases = {
+        "랩비": "lab_private",
+        "toss증권": "toss",
+        "대출": "debt",
+        "보험": "insurance",
+    }
+    if "@" in raw_key:
+        head, *tail = raw_key.split("@")
+        return key_aliases.get(head, head), "".join(tail) or None
+    return key_aliases.get(raw_key, raw_key), None
+
+
+def build_special_snapshot(account_key: str, balance: int, source: str, memo: str = "") -> AccountSnapshot:
+    return AccountSnapshot(
+        account_key=account_key,
+        balance=balance,
+        company=account_key,
+        account_type="Special",
+        name=account_key,
+        memo=memo,
+        is_special=True,
+        source=source,
+    )
+
+
+def load_openbank_accounts(exceptions: dict[str, list[str]]) -> Accounts:
+    with open(FILE_KB_PICKLE, "rb") as file_obj:
+        loaded = pickle.load(file_obj)
+
+    if not isinstance(loaded, list):
+        raise TypeError(f"{FILE_KB_PICKLE} must contain a list of rows")
+
+    accounts: Accounts = {}
+    for row in loaded:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            log(f"Skip malformed KB row: {row!r}")
+            continue
+        company = str(row[0]).strip()
+        account_type = str(row[1]).strip()
+        account_key = str(row[2]).strip()
+        name = str(row[3]).strip() or account_key
+        balance = parse_int_value(row[4])
+        if not account_key or balance is None:
+            log(f"Skip KB row with invalid account or balance: {row!r}")
+            continue
+        if company in exceptions.get("bank", []):
+            continue
+        if account_key in exceptions.get("accounts", []):
+            continue
+        merge_snapshot(
+            accounts,
+            AccountSnapshot(
+                account_key=account_key,
+                balance=balance,
+                company=company,
+                account_type=account_type,
+                name=name,
+                source="kb_openbank",
+            ),
+        )
+    return accounts
+
+
+def load_kb_securities(accounts: Accounts) -> None:
+    try:
+        with open(FILE_KBSELF_PICKLE, "rb") as file_obj:
+            loaded = pickle.load(file_obj)
+    except FileNotFoundError:
+        log(f"{FILE_KBSELF_PICKLE} not found; skipping KB securities.")
+        return
+
+    if not isinstance(loaded, dict):
+        raise TypeError(f"{FILE_KBSELF_PICKLE} must contain a dict")
+
+    for raw_key in all_datas.get("KBaccounts", []):
+        account_key = str(raw_key).strip()
+        if not account_key:
+            continue
+        raw_balance = loaded.get(account_key, 0)
+        balance = parse_int_value(raw_balance)
+        if balance is None:
+            log(f"Skip KB securities row with invalid balance: {account_key}={raw_balance!r}")
+            continue
+        if account_key not in loaded:
+            log(f"KB stock account not found ({account_key})")
+        existing = accounts.get(account_key)
+        merge_snapshot(
+            accounts,
+            AccountSnapshot(
+                account_key=account_key,
+                balance=balance,
+                company="KB증권" if existing is None else "",
+                account_type="종합위탁" if existing is None else "",
+                name="KB주식투자계좌" if existing is None else "",
+                source="kb_securities",
+            ),
+        )
+
+
+def apply_manual_inputs_from_db(cur: Any, accounts: Accounts) -> None:
     try:
         cur.execute(
-            f"""
-            SELECT DISTINCT ON (key_name) key_name, value
-            FROM "{MANUAL_INPUTS_TABLE}"
-            ORDER BY key_name, updated_at DESC, id DESC
-            """
+            f"SELECT key_name, value FROM \"{MANUAL_INPUTS_TABLE}\" ORDER BY key_name"
         )
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable) as e:
-        log(f"{MANUAL_INPUTS_TABLE} table not ready: {e}")
-        return accounts
-    except Exception as e:
-        log(f"Failed reading {MANUAL_INPUTS_TABLE}: {e}")
-        return accounts
+    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable) as exc:
+        log(f"{MANUAL_INPUTS_TABLE} is not ready: {exc}")
+        return
 
     for raw_key, raw_value in cur.fetchall():
         if raw_key is None:
-            log("Skip manual input with empty key_name")
             continue
-
         key_name = str(raw_key).strip()
-        if key_name == "":
-            log("Skip manual input with blank key_name")
+        if not key_name:
             continue
-
-        value = _parse_manual_value(raw_value)
+        value = parse_int_value(raw_value)
         if value is None:
-            log(f"Skip manual input with non-numeric value: {key_name}={raw_value}")
+            log(f"Skip manual input with non-numeric value: {key_name}={raw_value!r}")
             continue
-
-        accname, label = _normalize_manual_key(key_name)
-        if label is None:
-            log(f"=== manual input update: {accname} ===")
-        else:
-            log(f"=== manual input update: {accname} ({label}) ===")
-
-        if "@" in key_name and accname in accounts:
-            value += int(accounts[accname]["balance"][tnow])
-        accounts[accname] = {"balance": {tnow: value}}
-
-    return accounts
+        account_key, label = normalize_manual_key(key_name)
+        snapshot = build_special_snapshot(
+            account_key=account_key,
+            balance=value,
+            source="manual_inputs",
+            memo=label or "",
+        )
+        merge_snapshot(accounts, snapshot, additive="@" in key_name)
 
 
-# ---------------------------------------------------------------------------
-# DB: account info
-# ---------------------------------------------------------------------------
-
-@logger.with_logging(logs)
-@db_decorator()
-def cards_to_accounts(
-    cur: Any, tnow: str, accounts: dict
-) -> dict | tuple[str, Exception]:
-    """Run card analysis and reflect the result in *accounts*.
-
-    Args:
-        cur: DB cursor (injected by db_decorator).
-        tnow: Timestamp string for this run.
-        accounts: Existing accounts dict.
-
-    Returns:
-        Updated accounts dict or ``("ERROR", exc)``.
-    """
-    log("=== 카드 잔액 ===")
+def apply_creon_balance(accounts: Accounts) -> None:
+    if CREON_ACCOUNT_NUMBER in (None, ""):
+        raise RuntimeError("CREON_ACCOUNT_NUMBER is missing in the environment")
     try:
-        cards.main(cur, filepath_exel=filepath_cardexcel)
-    except Exception as e:
-        log(f"cards.main 에러: {e}")
-        return "ERROR", e
+        with open(FILE_CREON, "rb") as file_obj:
+            raw_balance = pickle.load(file_obj)
+    except FileNotFoundError:
+        raw_balance = 0
 
-    cur.execute(
-        "SELECT balance FROM accounts_cards "
-        "WHERE date IN (SELECT max(date) FROM accounts_cards)"
+    balance = parse_int_value(raw_balance)
+    if balance is None:
+        raise ValueError(f"{FILE_CREON} does not contain an int-like value")
+
+    existing = accounts.get(CREON_ACCOUNT_NUMBER)
+    merge_snapshot(
+        accounts,
+        AccountSnapshot(
+            account_key=CREON_ACCOUNT_NUMBER,
+            balance=balance,
+            company="" if existing else "CREON",
+            account_type="" if existing else "Brokerage",
+            name="" if existing else "CREON",
+            source="creon",
+        ),
     )
-    temp = cur.fetchone()
-    accounts["accounts_cards"] = {"balance": {tnow: int(temp[0])}}
-    return accounts
 
 
-@logger.with_logging(logs)
-@db_decorator()
-def last_card(cur: Any, tnow: str, accounts: dict) -> dict:
-    """Load the latest card balance without re-parsing the Excel file."""
-    cur.execute(
-        "SELECT balance FROM accounts_cards "
-        "WHERE date IN (SELECT max(date) FROM accounts_cards)"
-    )
-    val = cur.fetchone()
-    accounts["accounts_cards"] = {"balance": {tnow: int(val[0])}}
-    return accounts
+def should_refresh_cards(last_update: dict[str, float]) -> bool:
+    if not os.path.isfile(FILE_CARD_EXCEL):
+        return False
+    if "cards" not in last_update:
+        return True
+    if not os.path.isfile(FILE_CARD_PICKLE):
+        return True
+    card_pickle_date = dt.date.fromtimestamp(os.path.getmtime(FILE_CARD_PICKLE))
+    if card_pickle_date != now_local().date():
+        return True
+    return os.path.getmtime(FILE_CARD_EXCEL) != last_update["cards"]
 
 
-@logger.with_logging(logs)
-@db_decorator()
-def info_update(cur: Any, accounts: dict) -> None:
-    """Upsert account metadata into ``accounts_info`` table.
-
-    Args:
-        cur: DB cursor (injected by db_decorator).
-        accounts: Accounts dict with metadata keys.
-    """
-    try:
-        cur.execute("SELECT account_number FROM accounts_info LIMIT 1")
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-        cur.execute(
-            "CREATE TABLE accounts_info("
-            "account_number TEXT NOT NULL,"
-            "company TEXT,"
-            "type TEXT,"
-            "name TEXT,"
-            "memo TEXT,"
-            "PRIMARY KEY(account_number))"
-        )
-
-    insert_data = []
-    for acc_num, acc_data in accounts.items():
-        acc_data.setdefault("memo", "")
-        insert_data.append((
-            acc_num,
-            acc_data.get("company", ""),
-            acc_data.get("type", ""),
-            acc_data.get("name", ""),
-            acc_data.get("memo", ""),
-        ))
-
-    if insert_data:
-        psycopg2.extras.execute_values(
-            cur,
-            "INSERT INTO accounts_info (account_number, company, type, name, memo) VALUES %s ON CONFLICT (account_number) DO NOTHING",
-            insert_data
-        )
-
-
-@logger.with_logging(logs)
-@db_decorator()
-def balance_update(
-    cur: Any, accounts: dict, tnow: str, exceptions: dict
-) -> None:
-    """Persist per-account balance records and zero-out closed accounts.
-
-    Args:
-        cur: DB cursor (injected by db_decorator).
-        accounts: Accounts dict.
-        tnow: Timestamp string for this run.
-        exceptions: Banks/accounts excluded from processing.
-    """
-    # Pre-fetch all existing tables once ??avoids N individual SELECT-EXISTS queries
-    cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")
-    existing_tables = {row[0] for row in cur.fetchall()} - NON_ACCOUNT_TABLES
-
-    # Never treat non-account tables as account ledgers
-    accounts = {k: v for k, v in accounts.items() if k not in NON_ACCOUNT_TABLES}
-
-    # Create missing tables in a single loop (no individual SELECT per account)
-    for acc_num in accounts.keys():
-        if acc_num not in existing_tables:
-            cur.execute(
-                f'CREATE TABLE "{acc_num}" '
-                f'(date TEXT NOT NULL, balance INTEGER, PRIMARY KEY(date))'
-            )
-
-    # Bulk Insert values
-    for acc_num, acc_data in tqdm(accounts.items(), desc="balance_update"):
-        insert_data = []
-        
-        # Get last stored balance from DB for this account to avoid redundant inserts
-        last_stored_balance = None
-        if acc_num in existing_tables:
-            try:
-                cur.execute(
-                    f'SELECT balance FROM "{acc_num}" ORDER BY date DESC LIMIT 1'
-                )
-                row = cur.fetchone()
-                if row:
-                    last_stored_balance = int(row[0])
-            except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-                pass
-                
-        # Only add to insert_data if the balance is different from the last stored
-        for d, bal in acc_data["balance"].items():
-            if last_stored_balance is None or last_stored_balance != int(bal):
-                insert_data.append((d, bal))
-                last_stored_balance = int(bal) # Update for subsequent dates in the loop
-            else:
-                # Same balance; skip INSERT
-                pass
-
-        if insert_data:
-            psycopg2.extras.execute_values(
-                cur,
-                f'INSERT INTO "{acc_num}" (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING',
-                insert_data
-            )
-
-    # Zero-out accounts that disappeared from the feed
-    cur.execute("SELECT account_number, company FROM accounts_info")
-    all_info = cur.fetchall()
-    exc_accounts = set(exceptions.get("accounts", []))
-    exc_banks    = set(exceptions.get("bank", []))
-
-    zero_out_tasks = []
-    for acc_num, company in tqdm(all_info, desc="zero-out check"):
-        if acc_num in exc_accounts or company in exc_banks:
-            continue
-        if acc_num not in accounts and acc_num in existing_tables:
-            try:
-                cur.execute(
-                    f'SELECT balance FROM "{acc_num}" '
-                    f'ORDER BY date DESC LIMIT 1'
-                )
-                last = cur.fetchone()
-                if last and int(last[0]) != 0:
-                    zero_out_tasks.append((acc_num, tnow))
-            except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-                pass
-
-    for acc_num, date_val in zero_out_tasks:
-        try:
-            cur.execute(
-                f'INSERT INTO "{acc_num}" (date, balance) VALUES (%s, %s) ON CONFLICT (date) DO NOTHING',
-                (date_val, 0)
-            )
-        except Exception:
-            pass
-
-
-@logger.with_logging(logs)
-@db_decorator()
-def accounts_balance_update(cur: Any, accounts: dict) -> None:
-    """Append total balance and diff rows for the current snapshot.
-
-    Args:
-        cur: DB cursor (injected by db_decorator).
-        accounts: Accounts dict.
-    """
-    # Ensure summary tables exist
-    try:
-        cur.execute("SELECT max(date) FROM accounts_balance")
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-        cur.execute(
-            "CREATE TABLE accounts_balance("
-            "date TEXT, balance INTEGER, PRIMARY KEY(date))"
-        )
-    try:
-        cur.execute("SELECT max(date) FROM accounts_diff")
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-        cur.execute(
-            "CREATE TABLE accounts_diff("
-            "date TEXT, balance INTEGER, PRIMARY KEY(date))"
-        )
-
-    # Fetch last known total once (outside the loop)
+def fetch_latest_card_balance(cur: Any) -> int:
     try:
         cur.execute(
-            "SELECT balance FROM accounts_balance "
-            "ORDER BY date DESC LIMIT 1"
+            "SELECT balance FROM accounts_cards ORDER BY date DESC LIMIT 1"
         )
         row = cur.fetchone()
-        last_balance = int(row[0]) if row else 0
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
-        last_balance = 0
-
-    # Exclude non-account tables from total calculations
-    accounts = {k: v for k, v in accounts.items() if k not in NON_ACCOUNT_TABLES}
-
-    balance_insert_data = []
-    diff_insert_data = []
-
-    first_acc = next(iter(accounts))
-    for date_key in accounts[first_acc]["balance"]:
-        total = sum(
-            acc_data["balance"].get(date_key, 0)
-            for acc_data in accounts.values()
-        )
-        balance_insert_data.append((date_key, total))
-        diff_insert_data.append((date_key, total - last_balance))
-        last_balance = total
-
-    try:
-        if balance_insert_data:
-            psycopg2.extras.execute_values(
-                cur,
-                "INSERT INTO accounts_balance (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING",
-                balance_insert_data
-            )
-        if diff_insert_data:
-            psycopg2.extras.execute_values(
-                cur,
-                "INSERT INTO accounts_diff (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING",
-                diff_insert_data
-            )
-    except Exception as e:
-        log(f"Accounts  종합 업데이트 실패: {e}")
-        raise
-
-
-@logger.with_logging(logs)
-@db_decorator()
-def refresh_accounts_balance(cur: Any) -> None:
-    """Fully recompute ``accounts_balance`` and ``accounts_diff`` from scratch.
-
-    Pre-fetches all per-account data into memory to avoid N횞M PostgreSQL
-    round-trips (one SELECT per day 횞 table).
-    """
-    cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")
-    table_list = [row[0] for row in cur.fetchall() if row[0] not in NON_ACCOUNT_TABLES]
-
-    # --- Pre-fetch all balances into memory (keyed by table name) ---
-    # table_data[tab] = sorted list of (date, balance) tuples
-    table_data: Dict[str, list] = {}
-    all_dates: set = set()
-    for tab in table_list:
-        cur.execute(f'SELECT date, balance FROM "{tab}" ORDER BY date')
-        rows = cur.fetchall()
-        table_data[tab] = rows
-        all_dates.update(r[0] for r in rows)
-
-    days = sorted(all_dates)
-
-    # Build a cumulative pointer per table.
-    result = []
-    pointers: Dict[str, int] = {tab: 0 for tab in table_list}
-    last_vals: Dict[str, int] = {tab: 0 for tab in table_list}
-
-    log("refresh_accounts_balance: computing totals...")
-    for day in tqdm(days):
-        for tab in table_list:
-            rows = table_data[tab]
-            p = pointers[tab]
-            while p < len(rows) and rows[p][0] <= day:
-                last_vals[tab] = rows[p][1]
-                p += 1
-            pointers[tab] = p
-        result.append((day, sum(last_vals.values())))
-
-    cur.execute("DELETE FROM accounts_balance")
-    cur.execute("DELETE FROM accounts_diff")
-
-    log("refresh_accounts_balance: writing results using COPY...")
-    pval = 0
-    balance_buf = io.StringIO()
-    diff_buf = io.StringIO()
-    
-    balance_writer = csv.writer(balance_buf, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
-    diff_writer = csv.writer(diff_buf, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
-
-    for n, (day, total) in enumerate(tqdm(result)):
-        diff = 0 if n == 0 else total - pval
-        pval = total
-        balance_writer.writerow([day, total])
-        diff_writer.writerow([day, diff])
-
-    balance_buf.seek(0)
-    diff_buf.seek(0)
-
-    try:
-        cur.copy_from(balance_buf, 'accounts_balance', sep='\t', columns=['date', 'balance'])
-        cur.copy_from(diff_buf, 'accounts_diff', sep='\t', columns=['date', 'balance'])
-    except Exception as e:
-        log(f"COPY Error in refresh_accounts_balance: {e}")
-        pass
-
-
-@logger.with_logging(logs)
-@db_decorator()
-def refresh_daydiff(cur: Any, full_refresh: bool = False) -> bool:
-    """Populate ``accounts_daydiff`` with daily delta values.
-    If full_refresh is False, incrementally update from the last recorded date.
-    否则 rebuild from the very beginning."""
-    try:
-        cur.execute(
-            'SELECT date FROM "accounts_daydiff" '
-            'WHERE date IN (SELECT max(date) FROM "accounts_daydiff")'
-        )
-    except psycopg2.OperationalError:
-        cur.execute(
-            'CREATE TABLE "accounts_daydiff" '
-            "(date TEXT, balance INTEGER, PRIMARY KEY('date'))"
-        )
-        return False  # Table just created ??nothing to diff yet
-
-    cur.execute('SELECT min(date) FROM "accounts_balance"')
-    start_str = cur.fetchone()[0]
-    if not start_str:
-        return False
-    start = datetime.datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
-
-    cur.execute('SELECT max(date) FROM "accounts_balance"')
-    end_str = cur.fetchone()[0]
-    if not end_str:
-        return False
-    end = datetime.datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
-
-    start = datetime.datetime.combine(
-        datetime.date(start.year, start.month, start.day),
-        datetime.time(0, 0, 0),
-    )
-    end = datetime.datetime.combine(
-        datetime.date(end.year, end.month, end.day),
-        datetime.time(0, 0, 0),
-    )
-
-    if full_refresh:
-        cur.execute("DELETE FROM accounts_daydiff")
-        current_date_for_loop = start
-    else:
-        # Get the max date from accounts_daydiff
-        cur.execute('SELECT max(date) FROM "accounts_daydiff"')
-        last_diff_date_str = cur.fetchone()[0]
-        if last_diff_date_str:
-            last_diff_date = datetime.datetime.strptime(last_diff_date_str, "%Y-%m-%d")
-            # Delete the last day's diff because it might be incomplete for that day
-            cur.execute('DELETE FROM "accounts_daydiff" WHERE date = %s', (last_diff_date_str,))
-            current_date_for_loop = last_diff_date
-        else:
-            current_date_for_loop = start
-
-    # current = current_date_for_loop + 1 day
-    current = current_date_for_loop + datetime.timedelta(days=1)
-    cur.execute(
-        'SELECT balance FROM accounts_balance WHERE date < %s ORDER BY date DESC LIMIT 1',
-        (current.strftime("%Y-%m-%d %H:%M:%S"),),
-    )
-    last_balance = int(cur.fetchone()[0])
-
-    diffdatas = []
-    while True:
-        cur.execute(
-            'SELECT balance FROM accounts_balance WHERE date < %s ORDER BY date DESC LIMIT 1',
-            ((current + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),),
-        )
-        row = cur.fetchone()
-        cur_balance = int(row[0])
-        day_label = current.strftime("%Y-%m-%d")
-        diffdatas.append((day_label, cur_balance - last_balance))
-        last_balance = cur_balance
-
-        if current >= end:
-            break
-        current += datetime.timedelta(days=1)
-
-    if diffdatas:
-        psycopg2.extras.execute_values(
-            cur,
-            "INSERT INTO accounts_daydiff (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING",
-            diffdatas
-        )
-    return True
-
-
-@logger.with_logging(logs)
-@db_decorator()
-def refresh_monthdiff(cur: Any, full_refresh: bool = False) -> bool:
-    """Populate ``accounts_monthdiff`` with month-end delta values.
-    If full_refresh is False, incrementally update from the last recorded month.
-    否则 rebuild from the very beginning."""
-    try:
-        cur.execute(
-            'SELECT date FROM "accounts_monthdiff" '
-            'WHERE date IN (SELECT max(date) FROM "accounts_monthdiff")'
-        )
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
     except Exception:
-        cur.execute(
-            'CREATE TABLE "accounts_monthdiff" '
-            "(date TEXT, balance INTEGER, PRIMARY KEY('date'))"
-        )
-        return False  # Table just created ??nothing to diff yet
+        return 0
 
-    cur.execute('SELECT min(date) FROM "accounts_balance"')
-    start_str = cur.fetchone()[0]
-    if not start_str:
-        return False
-    start = datetime.datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
 
-    cur.execute('SELECT max(date) FROM "accounts_balance"')
-    end_str = cur.fetchone()[0]
-    if not end_str:
-        return False
-    end = datetime.datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
-
-    start = datetime.datetime.combine(
-        datetime.date(start.year, start.month, 1), datetime.time(0, 0, 0)
-    )
-
-    if full_refresh:
-        cur.execute("DELETE FROM accounts_monthdiff")
-        current_date_for_loop = start
+def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accounts) -> bool:
+    refresh_cards = should_refresh_cards(last_update)
+    if refresh_cards:
+        log("Refreshing card balances from Excel")
+        cards.main(cur, filepath_exel=FILE_CARD_EXCEL)
+        last_update["cards"] = os.path.getmtime(FILE_CARD_EXCEL)
     else:
-        # Get the max date from accounts_monthdiff
-        cur.execute('SELECT max(date) FROM "accounts_monthdiff"')
-        last_diff_date_str = cur.fetchone()[0]
-        if last_diff_date_str:
-            last_diff_date = datetime.datetime.strptime(last_diff_date_str, "%Y-%m-%d")
-            # Delete the last month's diff because it might be incomplete for that month
-            cur.execute('DELETE FROM "accounts_monthdiff" WHERE date = %s', (last_diff_date_str,))
-            # The last diff date is something like 2026-02-28 (end of month)
-            # We need to set `current_date_for_loop` to the first of that month
-            # so the logic below advances it to the next month properly.
-            current_date_for_loop = datetime.datetime.combine(
-                datetime.date(last_diff_date.year, last_diff_date.month, 1), datetime.time(0, 0, 0)
-            )
-        else:
-            current_date_for_loop = start
+        log("Using latest stored card balance")
 
-    # Advance to the first day of the next month
-    if current_date_for_loop.month < 12:
-        current = datetime.datetime.combine(
-            datetime.date(current_date_for_loop.year, current_date_for_loop.month + 1, 1), datetime.time(0, 0, 0)
-        )
-    else:
-        current = datetime.datetime.combine(
-            datetime.date(current_date_for_loop.year + 1, 1, 1), datetime.time(0, 0, 0)
-        )
-
-    cur.execute(
-        'SELECT balance FROM accounts_balance WHERE date < %s ORDER BY date DESC LIMIT 1',
-        (current.strftime("%Y-%m-%d %H:%M:%S"),),
+    card_balance = fetch_latest_card_balance(cur)
+    merge_snapshot(
+        accounts,
+        build_special_snapshot(
+            account_key="accounts_cards",
+            balance=card_balance,
+            source="cards",
+        ),
     )
-    last_balance = int(cur.fetchone()[0])
-
-    diffdatas = []
-    while True:
-        # Advance current to the first day of the following month
-        if current.month < 12:
-            current = datetime.datetime.combine(
-                datetime.date(current.year, current.month + 1, 1),
-                datetime.time(0, 0, 0),
-            )
-        else:
-            current = datetime.datetime.combine(
-                datetime.date(current.year + 1, 1, 1), datetime.time(0, 0, 0)
-            )
-
-        cur.execute(
-            'SELECT balance FROM accounts_balance WHERE date < %s ORDER BY date DESC LIMIT 1',
-            (current.strftime("%Y-%m-%d %H:%M:%S"),),
-        )
-        row = cur.fetchone()
-        this_balance = int(row[0])
-
-        if current <= end:
-            whenisit = str((current - datetime.timedelta(days=1)).date())
-        else:
-            whenisit = str(end.date())
-
-        diffdatas.append((whenisit, this_balance - last_balance))
-        last_balance = this_balance
-
-        if current > end:
-            break
-
-    if diffdatas:
-        psycopg2.extras.execute_values(
-            cur,
-            "INSERT INTO accounts_monthdiff (date, balance) VALUES %s ON CONFLICT (date) DO NOTHING",
-            diffdatas
-        )
-    return True
+    return refresh_cards
 
 
-@logger.with_logging(logs)
-@db_decorator()
-def delete_from_a_table(
-    cur: Any, tab: str, dates: list[str]
-) -> bool | tuple[str, Exception]:
-    """Delete multiple date rows from *tab* in a single query.
-
-    Args:
-        cur: DB cursor (injected by db_decorator).
-        tab: Target table name.
-        dates: List of date values to delete.
-
-    Returns:
-        ``True`` on success or ``("ERROR", exc)`` on failure.
-    """
-    if not dates:
-        return True
-    try:
-        cur.execute(f'DELETE FROM "{tab}" WHERE date = ANY(%s)', (dates,))
-        return True
-    except Exception as e:
-        log(f"delete_from_a_table error in {tab}: {e}")
-        return "ERROR", e
+def validate_total(accounts: Accounts) -> None:
+    total = sum(snapshot.balance for snapshot in accounts.values())
+    log(f"Sanity total: {total:,}")
+    if total <= 150_000_000:
+        raise ValueError("Total below 150,000,000; aborting as suspicious")
 
 
-@logger.with_logging(logs)
-@db_decorator()
-def duplicated_remover(cur: Any) -> None:
-    """Remove redundant rows where consecutive values are equal, keeping only the first (oldest)."""
-    cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")
-    excluded = NON_ACCOUNT_TABLES - {"accounts_balance"}
-    table_list = [row[0] for row in cur.fetchall() if row[0] not in excluded]
-
-    for tab in tqdm(table_list, desc="duplicated_remover"):
-        cur.execute(f'SELECT date, balance FROM "{tab}" ORDER BY date')
-        values = cur.fetchall()
-        del_list = [
-            values[n][0]
-            for n in range(1, len(values))
-            if values[n][1] == values[n - 1][1]
-        ]
-        if del_list:
-            cur.execute(f'DELETE FROM "{tab}" WHERE date = ANY(%s)', (del_list,))
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-@logger.with_logging(logs)
-@db_decorator()
-def KB_main(cur: Any) -> bool | tuple[str, Exception]:
-    """Run the full account-balance update pipeline."""
-    global db_con
-
-    # ?? 1. Prepare shared variables ??????????????????????????????????????
-    log("=== 초기 변수 준비===")
-    try:
-        tnow, last_update, exceptions = KB_prepare()
-    except Exception as e:
-        return "ERROR", e
-
-    # ?? 2. KB open-banking & securities ??????????????????????????????????
-    log("=== KB 증권 오픈뱅킹/계좌 업데이트 ===")
-    try:
-        if os.path.isfile(FILE_KB_PICKLE):
-            last_update["KB"] = os.path.getmtime(FILE_KB_PICKLE)
-        else:
-            raise FileNotFoundError(f"{FILE_KB_PICKLE} is missing")
-
-        log("=== KB.pickle 분석 ===")
-        accounts = kbstock_openbank(tnow, exceptions)
-        if not isinstance(accounts, dict):
-            raise Exception("KB증권-오픈뱅킹 결과 값 에러")
-        accounts = kbstock(tnow, accounts)
-        if not isinstance(accounts, dict):
-            raise Exception("KB증권-오픈뱅킹 결과 값 에러")
-    except Exception as e:
-        return "ERROR", e
-
-    # ?? 3. Manual / CREON entries ?????????????????????????????????????????
-    try:
-        log("manual input DB 처리")
-        accounts = _apply_manual_inputs_from_db(cur=cur, tnow=tnow, accounts=accounts)
-
-        log("=== CREON 잔고 업데이트 ===")
-        if CREON_ACCOUNT_NUMBER in (None, ""):
-            raise ValueError("CREON_ACCOUNT_NUMBER is missing in .env")
-        accounts = pickle_read(tnow, accounts, fp=FILE_CREON, accname=CREON_ACCOUNT_NUMBER)
-        if not isinstance(accounts, dict):
-            raise Exception("CREON 업데이트 에")
-    except Exception as e:
-        return "ERROR", e
-
-    # ?? 4. Sanity-check total  ????????????????????????????????????????????
-    try:
-        totals = sum(
-            acc_data["balance"][max(acc_data["balance"])]
-            for acc_data in accounts.values()
-        )
-        log(f"총액: {totals:,}")
-        if totals <= 150_000_000:
-            raise ValueError("15천만원 미만 결과는 뭔가 문제가 있다고 생각됨")
-    except Exception as e:
-        e.add_note("분석 결과 150,000,000 미만 => 문제 있다고 판단하고 종료")
-        return "ERROR", e
-
-    # ?? 5. Card debt  ?????????????????????????????????????????????????????
-    go_analysis_card = True
-    try:
-        if "cards" in last_update:
-            cards_excel_mtime = os.path.getmtime(filepath_cardexcel)
-            if (
-                datetime.date.fromtimestamp(os.path.getmtime("cards.pickle"))
-                == datetime.date.today()
-                and cards_excel_mtime == last_update["cards"]
-            ):
-                go_analysis_card = False
-
-        if go_analysis_card:
-            accounts = cards_to_accounts(tnow=tnow, accounts=accounts)
-            if not isinstance(accounts, dict):
-                raise Exception("카드 업데이트 에러")
-            last_update["cards"] = os.path.getmtime(filepath_cardexcel)
-        else:
-            log("카드 excel 파일이 없음")
-            last_card(tnow=tnow, accounts=accounts)
-    except Exception as e:
-        return "ERROR", e
-
-    # ?? 6. Write account info ?????????????????????????????????????????????
-    log("=== 계좌 정보 업데이트 ===")
-    try:
-        info_update(accounts=accounts)
-    except Exception as e:
-        return "ERROR", e
-
-    # ?? 7. Remove exceptions (build filtered copy ??no in-place mutation) ??
-    exc_accounts = set(exceptions.get("accounts", []))
-    exc_banks    = set(exceptions.get("bank", []))
-    accounts = {
-        k: v
-        for k, v in accounts.items()
-        if k not in exc_accounts
-        and v.get("company", "") not in exc_banks
+def filter_accounts(accounts: Accounts, exceptions: dict[str, list[str]]) -> Accounts:
+    excluded_accounts = set(exceptions.get("accounts", []))
+    excluded_banks = set(exceptions.get("bank", []))
+    return {
+        key: snapshot
+        for key, snapshot in accounts.items()
+        if key not in excluded_accounts and snapshot.company not in excluded_banks
     }
 
-    # ?? 8. Per-account balance update ?????????????????????????????????????
-    log("=== 계좌 잔고 업데이트 ===")
-    balance_update(accounts=accounts, tnow=tnow, exceptions=exceptions)
 
-    # ?? 9. Total balance update ???????????????????????????????????????????
+def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> None:
+    rows = []
+    for snapshot in accounts.values():
+        rows.append(
+            (
+                snapshot.account_key,
+                snapshot.company,
+                snapshot.account_type,
+                snapshot.name or snapshot.account_key,
+                snapshot.memo,
+                snapshot.is_special or snapshot.account_key in KNOWN_SPECIAL_KEYS,
+                is_active,
+            )
+        )
+    if not rows:
+        return
+
+    psycopg2.extras.execute_values(
+        cur,
+        """
+        INSERT INTO accounts (
+            account_key, company, type, name, memo, is_special, is_active
+        ) VALUES %s
+        ON CONFLICT (account_key) DO UPDATE SET
+            company = CASE WHEN EXCLUDED.company <> '' THEN EXCLUDED.company ELSE accounts.company END,
+            type = CASE WHEN EXCLUDED.type <> '' THEN EXCLUDED.type ELSE accounts.type END,
+            name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE accounts.name END,
+            memo = CASE WHEN EXCLUDED.memo <> '' THEN EXCLUDED.memo ELSE accounts.memo END,
+            is_special = accounts.is_special OR EXCLUDED.is_special,
+            is_active = EXCLUDED.is_active,
+            updated_at = now()
+        """,
+        rows,
+    )
+
+
+def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> None:
+    rows = [
+        (snapshot.account_key, recorded_at, snapshot.balance, snapshot.source)
+        for snapshot in accounts.values()
+    ]
+    if not rows:
+        return
+
+    psycopg2.extras.execute_values(
+        cur,
+        """
+        INSERT INTO account_balance_history (
+            account_key, recorded_at, balance, source
+        ) VALUES %s
+        ON CONFLICT (account_key, recorded_at) DO UPDATE SET
+            balance = EXCLUDED.balance,
+            source = EXCLUDED.source
+        """,
+        rows,
+    )
+
+
+def zero_out_missing_accounts(
+    cur: Any,
+    current_accounts: Accounts,
+    recorded_at: dt.datetime,
+    exceptions: dict[str, list[str]],
+) -> None:
+    cur.execute(
+        """
+        SELECT
+            a.account_key,
+            a.company,
+            COALESCE(latest.balance, 0) AS latest_balance
+        FROM accounts a
+        LEFT JOIN LATERAL (
+            SELECT balance
+            FROM account_balance_history h
+            WHERE h.account_key = a.account_key
+            ORDER BY h.recorded_at DESC
+            LIMIT 1
+        ) AS latest ON TRUE
+        ORDER BY a.account_key
+        """
+    )
+
+    excluded_accounts = set(exceptions.get("accounts", []))
+    excluded_banks = set(exceptions.get("bank", []))
+    rows_to_insert = []
+    zeroed_accounts = []
+    for account_key, company, latest_balance in cur.fetchall():
+        if account_key in excluded_accounts or company in excluded_banks:
+            continue
+        if account_key in current_accounts:
+            continue
+        if latest_balance is None or int(latest_balance) == 0:
+            continue
+        rows_to_insert.append((account_key, recorded_at, 0, "zero_out"))
+        zeroed_accounts.append(account_key)
+
+    if rows_to_insert:
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO account_balance_history (
+                account_key, recorded_at, balance, source
+            ) VALUES %s
+            ON CONFLICT (account_key, recorded_at) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                source = EXCLUDED.source
+            """,
+            rows_to_insert,
+        )
+    if zeroed_accounts:
+        cur.execute(
+            "UPDATE accounts SET is_active = FALSE, updated_at = now() WHERE account_key = ANY(%s)",
+            (zeroed_accounts,),
+        )
+
+
+def chunked(rows: list[tuple], size: int = 2000) -> list[list[tuple]]:
+    return [rows[index : index + size] for index in range(0, len(rows), size)]
+
+
+def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
+    cur.execute(
+        """
+        SELECT account_key, recorded_at, balance
+        FROM account_balance_history
+        ORDER BY recorded_at, account_key
+        """
+    )
+    latest_by_account: dict[str, int] = {}
+    total = 0
+    current_ts: dt.datetime | None = None
+    portfolio_rows: list[tuple[dt.datetime, int]] = []
+
+    for account_key, recorded_at, balance in progress_iter(cur.fetchall(), desc="portfolio_totals"):
+        if current_ts is not None and recorded_at != current_ts:
+            portfolio_rows.append((current_ts, total))
+        balance_int = int(balance)
+        previous = latest_by_account.get(account_key, 0)
+        total += balance_int - previous
+        latest_by_account[account_key] = balance_int
+        current_ts = recorded_at
+
+    if current_ts is not None:
+        portfolio_rows.append((current_ts, total))
+    return portfolio_rows
+
+
+def build_daydiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
+    day_totals: dict[dt.date, int] = {}
+    for recorded_at, balance in portfolio_rows:
+        local_date = recorded_at.astimezone(get_app_timezone()).date()
+        day_totals[local_date] = int(balance)
+
+    ordered = sorted(day_totals.items())
+    result: list[tuple[dt.date, int]] = []
+    previous_total: int | None = None
+    for balance_date, total in ordered:
+        if previous_total is None:
+            previous_total = total
+            continue
+        result.append((balance_date, total - previous_total))
+        previous_total = total
+    return result
+
+
+def build_monthdiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
+    month_totals: dict[tuple[int, int], int] = {}
+    month_labels: dict[tuple[int, int], dt.date] = {}
+    for recorded_at, balance in portfolio_rows:
+        local_stamp = recorded_at.astimezone(get_app_timezone())
+        month_key = (local_stamp.year, local_stamp.month)
+        month_totals[month_key] = int(balance)
+        month_labels[month_key] = local_stamp.date()
+
+    ordered_keys = sorted(month_totals)
+    result: list[tuple[dt.date, int]] = []
+    previous_total: int | None = None
+    for month_key in ordered_keys:
+        total = month_totals[month_key]
+        if previous_total is None:
+            previous_total = total
+            continue
+        result.append((month_labels[month_key], total - previous_total))
+        previous_total = total
+    return result
+
+
+def rebuild_portfolio_summaries(cur: Any) -> None:
+    portfolio_rows = compute_portfolio_rows(cur)
+    daydiff_rows = build_daydiff_rows(portfolio_rows)
+    monthdiff_rows = build_monthdiff_rows(portfolio_rows)
+
+    cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
+
+    for chunk in chunked(portfolio_rows):
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO portfolio_balance_history (recorded_at, balance)
+            VALUES %s
+            ON CONFLICT (recorded_at) DO UPDATE SET balance = EXCLUDED.balance
+            """,
+            chunk,
+        )
+
+    for chunk in chunked(daydiff_rows):
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO portfolio_daydiff (balance_date, balance)
+            VALUES %s
+            ON CONFLICT (balance_date) DO UPDATE SET balance = EXCLUDED.balance
+            """,
+            chunk,
+        )
+
+    for chunk in chunked(monthdiff_rows):
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO portfolio_monthdiff (balance_date, balance)
+            VALUES %s
+            ON CONFLICT (balance_date) DO UPDATE SET balance = EXCLUDED.balance
+            """,
+            chunk,
+        )
+
+
+def KB_main() -> bool | tuple[str, Exception]:
+    connection = None
     try:
-        if not go_analysis_card:
-            log("=== 종합잔고 업데이트 ===")
-            # print("=== 종합잔고 업데이트 ===", flush=True)
-            accounts_balance_update(accounts=accounts)
-        else:
-            log("=== 종합잔고 전체 갱신 ===")
-            # print("=== 醫낇빀?붽퀬 ?꾩껜 媛깆떊 ===", flush=True)
-            refresh_accounts_balance()
-    except Exception as e:
-        print(f"[ERROR] 종합잔고 갱신 실패: {e!r}", flush=True)
-        return "ERROR", e
+        log("=== Prepare run context ===")
+        recorded_at = now_local().replace(microsecond=0)
+        last_update = lst_udt(operation="read")
+        exceptions = load_exceptions()
 
-    # ?? 10. Daily / monthly diff ??????????????????????????????????????????
-    log("=== 잔고 일별/월별 변동 업데이트 ===")
-    # print("=== ?붽퀬 ?쇰퀎/?붾퀎 蹂???낅뜲?댄듃 ===", flush=True)
-    try:
-        refresh_daydiff(full_refresh=go_analysis_card)
-        refresh_monthdiff(full_refresh=go_analysis_card)
-    except Exception as e:
-        print(f"[ERROR] 잔고 일별/월별 변동 업데이트 실패: {e!r}", flush=True)
-        return "ERROR", e
+        if not os.path.isfile(FILE_KB_PICKLE):
+            raise FileNotFoundError(f"{FILE_KB_PICKLE} is missing")
+        last_update["KB"] = os.path.getmtime(FILE_KB_PICKLE)
 
-    # ?? 11. Deduplicate ???????????????????????????????????????????????????
-    log("=== 중복제거 ===")
-    # print("=== 以묐났?쒓귗 ===", flush=True)
-    try:
-        if go_analysis_card:
-            duplicated_remover()
-        else:
-            log("Skip duplicated_remover (not a full update)")
-    except Exception as e:
-        print(f"[ERROR] 중복제거 실패: {e!r}", flush=True)
-        return "ERROR", e
+        log("=== Load KB openbank data ===")
+        accounts = load_openbank_accounts(exceptions)
+        load_kb_securities(accounts)
 
-    # ?? 12. Persist last_update & commit ??????????????????????????????????
-    if not lst_udt(operation="save", last_update=last_update):
-        raise Exception(".last_update.pickle 저장 실패")
+        connection = get_db_connection()
+        cur = connection.cursor()
+        ensure_normalized_schema(cur)
 
-    try:
+        log("=== Apply manual inputs ===")
+        apply_manual_inputs_from_db(cur, accounts)
+
+        log("=== Apply CREON balance ===")
+        apply_creon_balance(accounts)
+
+        validate_total(accounts)
+
+        log("=== Apply card balance ===")
+        apply_card_balance(cur, last_update, accounts)
+
+        filtered_accounts = filter_accounts(accounts, exceptions)
+        if not filtered_accounts:
+            raise RuntimeError("No accounts remained after filtering")
+
+        log("=== Upsert account metadata ===")
+        upsert_accounts(cur, filtered_accounts, is_active=True)
+
+        log("=== Insert account history ===")
+        insert_account_history(cur, filtered_accounts, recorded_at)
+        zero_out_missing_accounts(cur, filtered_accounts, recorded_at, exceptions)
+
+        log("=== Rebuild portfolio summaries ===")
+        rebuild_portfolio_summaries(cur)
+
+        connection.commit()
         cur.close()
-        db_con.commit()   # type: ignore[union-attr]
-        db_con.close()    # type: ignore[union-attr]
-        db_con = None
-    except Exception as e:
-        log(f"DB 저장 실패: {e}")
+        connection.close()
+        connection = None
 
-    return True
+        if not lst_udt(operation="save", last_update=last_update):
+            raise RuntimeError(f"Failed to save {FILE_LAST_UPDATE}")
+
+        log("=== Complete ===")
+        return True
+    except Exception as exc:
+        if connection is not None:
+            connection.rollback()
+            connection.close()
+        return ("ERROR", exc)
 
 
 if __name__ == "__main__":
     result = KB_main()
     if isinstance(result, tuple) and result[0] == "ERROR":
-        print(f"\n[ERROR] KB_main 실패: {result[1]!r}")
+        print(f"\n[ERROR] KB_main failed: {result[1]!r}")
         raise SystemExit(1)
-    else:
-        print("\n=== 종료 ===")
+    print("\n=== exit ===")
