@@ -1,8 +1,8 @@
-﻿"""KB.py ??Total Account Tracker
+﻿"""KB.py Total Account Tracker
 Fetches and persists account balances from KB banking/securities pickles,
 manual entries, card data, and CREON, into a local PostgreSQL database.
 
-Last modified: 2026-03-04 (optimized)
+Last modified: 2026-03-17 (optimized)
 """
 import os
 import cards
@@ -22,7 +22,7 @@ from tqdm import tqdm
 from KB_web import all_datas
 import logger
 
-print("Last modified: 2026-03-04 with Antigravity - Claude Sonnet 4.6")
+print("Last modified: 2026-03-17 with Antigravity - Gemini 3.1 Pro")
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -508,7 +508,30 @@ def balance_update(
 
     # Bulk Insert values
     for acc_num, acc_data in tqdm(accounts.items(), desc="balance_update"):
-        insert_data = list(acc_data["balance"].items())
+        insert_data = []
+        
+        # Get last stored balance from DB for this account to avoid redundant inserts
+        last_stored_balance = None
+        if acc_num in existing_tables:
+            try:
+                cur.execute(
+                    f'SELECT balance FROM "{acc_num}" ORDER BY date DESC LIMIT 1'
+                )
+                row = cur.fetchone()
+                if row:
+                    last_stored_balance = int(row[0])
+            except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
+                pass
+                
+        # Only add to insert_data if the balance is different from the last stored
+        for d, bal in acc_data["balance"].items():
+            if last_stored_balance is None or last_stored_balance != int(bal):
+                insert_data.append((d, bal))
+                last_stored_balance = int(bal) # Update for subsequent dates in the loop
+            else:
+                # Same balance; skip INSERT
+                pass
+
         if insert_data:
             psycopg2.extras.execute_values(
                 cur,
@@ -687,8 +710,10 @@ def refresh_accounts_balance(cur: Any) -> None:
 
 @logger.with_logging(logs)
 @db_decorator()
-def refresh_daydiff(cur: Any) -> bool:
-    """Populate ``accounts_daydiff`` with daily delta values."""
+def refresh_daydiff(cur: Any, full_refresh: bool = False) -> bool:
+    """Populate ``accounts_daydiff`` with daily delta values.
+    If full_refresh is False, incrementally update from the last recorded date.
+    否则 rebuild from the very beginning."""
     try:
         cur.execute(
             'SELECT date FROM "accounts_daydiff" '
@@ -701,12 +726,17 @@ def refresh_daydiff(cur: Any) -> bool:
         )
         return False  # Table just created ??nothing to diff yet
 
-    cur.execute("DELETE FROM accounts_daydiff")
-
     cur.execute('SELECT min(date) FROM "accounts_balance"')
-    start = datetime.datetime.strptime(cur.fetchone()[0], "%Y-%m-%d %H:%M:%S")
+    start_str = cur.fetchone()[0]
+    if not start_str:
+        return False
+    start = datetime.datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+
     cur.execute('SELECT max(date) FROM "accounts_balance"')
-    end = datetime.datetime.strptime(cur.fetchone()[0], "%Y-%m-%d %H:%M:%S")
+    end_str = cur.fetchone()[0]
+    if not end_str:
+        return False
+    end = datetime.datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
 
     start = datetime.datetime.combine(
         datetime.date(start.year, start.month, start.day),
@@ -717,8 +747,23 @@ def refresh_daydiff(cur: Any) -> bool:
         datetime.time(0, 0, 0),
     )
 
-    # current = 泥??좎쓽 ?ㅼ쓬??湲곗??쇰줈 ?쒖옉 (start ?좎쭨???붽퀬瑜?last_balance濡??ъ슜)
-    current = start + datetime.timedelta(days=1)
+    if full_refresh:
+        cur.execute("DELETE FROM accounts_daydiff")
+        current_date_for_loop = start
+    else:
+        # Get the max date from accounts_daydiff
+        cur.execute('SELECT max(date) FROM "accounts_daydiff"')
+        last_diff_date_str = cur.fetchone()[0]
+        if last_diff_date_str:
+            last_diff_date = datetime.datetime.strptime(last_diff_date_str, "%Y-%m-%d")
+            # Delete the last day's diff because it might be incomplete for that day
+            cur.execute('DELETE FROM "accounts_daydiff" WHERE date = %s', (last_diff_date_str,))
+            current_date_for_loop = last_diff_date
+        else:
+            current_date_for_loop = start
+
+    # current = current_date_for_loop + 1 day
+    current = current_date_for_loop + datetime.timedelta(days=1)
     cur.execute(
         'SELECT balance FROM accounts_balance WHERE date < %s ORDER BY date DESC LIMIT 1',
         (current.strftime("%Y-%m-%d %H:%M:%S"),),
@@ -752,8 +797,10 @@ def refresh_daydiff(cur: Any) -> bool:
 
 @logger.with_logging(logs)
 @db_decorator()
-def refresh_monthdiff(cur: Any) -> bool:
-    """Populate ``accounts_monthdiff`` with month-end delta values."""
+def refresh_monthdiff(cur: Any, full_refresh: bool = False) -> bool:
+    """Populate ``accounts_monthdiff`` with month-end delta values.
+    If full_refresh is False, incrementally update from the last recorded month.
+    否则 rebuild from the very beginning."""
     try:
         cur.execute(
             'SELECT date FROM "accounts_monthdiff" '
@@ -766,25 +813,50 @@ def refresh_monthdiff(cur: Any) -> bool:
         )
         return False  # Table just created ??nothing to diff yet
 
-    cur.execute("DELETE FROM accounts_monthdiff")
-
     cur.execute('SELECT min(date) FROM "accounts_balance"')
-    start = datetime.datetime.strptime(cur.fetchone()[0], "%Y-%m-%d %H:%M:%S")
+    start_str = cur.fetchone()[0]
+    if not start_str:
+        return False
+    start = datetime.datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+
     cur.execute('SELECT max(date) FROM "accounts_balance"')
-    end = datetime.datetime.strptime(cur.fetchone()[0], "%Y-%m-%d %H:%M:%S")
+    end_str = cur.fetchone()[0]
+    if not end_str:
+        return False
+    end = datetime.datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
 
     start = datetime.datetime.combine(
         datetime.date(start.year, start.month, 1), datetime.time(0, 0, 0)
     )
 
+    if full_refresh:
+        cur.execute("DELETE FROM accounts_monthdiff")
+        current_date_for_loop = start
+    else:
+        # Get the max date from accounts_monthdiff
+        cur.execute('SELECT max(date) FROM "accounts_monthdiff"')
+        last_diff_date_str = cur.fetchone()[0]
+        if last_diff_date_str:
+            last_diff_date = datetime.datetime.strptime(last_diff_date_str, "%Y-%m-%d")
+            # Delete the last month's diff because it might be incomplete for that month
+            cur.execute('DELETE FROM "accounts_monthdiff" WHERE date = %s', (last_diff_date_str,))
+            # The last diff date is something like 2026-02-28 (end of month)
+            # We need to set `current_date_for_loop` to the first of that month
+            # so the logic below advances it to the next month properly.
+            current_date_for_loop = datetime.datetime.combine(
+                datetime.date(last_diff_date.year, last_diff_date.month, 1), datetime.time(0, 0, 0)
+            )
+        else:
+            current_date_for_loop = start
+
     # Advance to the first day of the next month
-    if start.month < 12:
+    if current_date_for_loop.month < 12:
         current = datetime.datetime.combine(
-            datetime.date(start.year, start.month + 1, 1), datetime.time(0, 0, 0)
+            datetime.date(current_date_for_loop.year, current_date_for_loop.month + 1, 1), datetime.time(0, 0, 0)
         )
     else:
         current = datetime.datetime.combine(
-            datetime.date(start.year + 1, 1, 1), datetime.time(0, 0, 0)
+            datetime.date(current_date_for_loop.year + 1, 1, 1), datetime.time(0, 0, 0)
         )
 
     cur.execute(
@@ -861,7 +933,7 @@ def delete_from_a_table(
 @logger.with_logging(logs)
 @db_decorator()
 def duplicated_remover(cur: Any) -> None:
-    """Remove redundant middle rows where three consecutive values are equal."""
+    """Remove redundant rows where consecutive values are equal, keeping only the first (oldest)."""
     cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")
     excluded = NON_ACCOUNT_TABLES - {"accounts_balance"}
     table_list = [row[0] for row in cur.fetchall() if row[0] not in excluded]
@@ -870,9 +942,9 @@ def duplicated_remover(cur: Any) -> None:
         cur.execute(f'SELECT date, balance FROM "{tab}" ORDER BY date')
         values = cur.fetchall()
         del_list = [
-            values[n + 1][0]
-            for n in range(len(values) - 2)
-            if values[n][1] == values[n + 1][1] == values[n + 2][1]
+            values[n][0]
+            for n in range(1, len(values))
+            if values[n][1] == values[n - 1][1]
         ]
         if del_list:
             cur.execute(f'DELETE FROM "{tab}" WHERE date = ANY(%s)', (del_list,))
@@ -1002,8 +1074,8 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
     log("=== 잔고 일별/월별 변동 업데이트 ===")
     # print("=== ?붽퀬 ?쇰퀎/?붾퀎 蹂???낅뜲?댄듃 ===", flush=True)
     try:
-        refresh_daydiff()
-        refresh_monthdiff()
+        refresh_daydiff(full_refresh=go_analysis_card)
+        refresh_monthdiff(full_refresh=go_analysis_card)
     except Exception as e:
         print(f"[ERROR] 잔고 일별/월별 변동 업데이트 실패: {e!r}", flush=True)
         return "ERROR", e
@@ -1012,7 +1084,10 @@ def KB_main(cur: Any) -> bool | tuple[str, Exception]:
     log("=== 중복제거 ===")
     # print("=== 以묐났?쒓귗 ===", flush=True)
     try:
-        duplicated_remover()
+        if go_analysis_card:
+            duplicated_remover()
+        else:
+            log("Skip duplicated_remover (not a full update)")
     except Exception as e:
         print(f"[ERROR] 중복제거 실패: {e!r}", flush=True)
         return "ERROR", e
