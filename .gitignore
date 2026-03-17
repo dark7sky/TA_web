@@ -16,6 +16,12 @@ ss.ratio
 *.png
 *.csv
 venv_nb/
+*.pickle
+*.bak
+debug
+*.xlsx
+*.txt
+*.csv
 # Keep only target Python sources by default
 *.py
 !KB.py
