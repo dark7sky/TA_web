@@ -29,7 +29,7 @@ import inspect
 import functools
 from typing import Callable, Any
 from notify_telegram import simpleTelegram
-
+import git
 # import KB
 
 # 타입 alias
@@ -851,6 +851,13 @@ def main():
         # time_sleep_update_min(__name__, 0)
         # os.system(".\\dist\\KB.exe")
         # KB.KB_main()
+        
+        repo = git.Repo("https://github.com/dark7sky/TA_web.git")
+        origin = repo.remotes.origin
+        info=origin.pull()
+        for item in info:
+            print(f"Updated {item.ref} to {item.comit}")
+
         os.system(".\\venv\\Scripts\\python.exe KB.py")
         # time_sleep_update_min(__name__, 0)
         print("===Done===")

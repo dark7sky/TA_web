@@ -21,3 +21,4 @@ paramiko
 pywinauto
 websockets
 tqdm
+GitPython

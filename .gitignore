@@ -13,7 +13,9 @@ config
 *.spec
 *.checker
 ss.ratio
-
+*.png
+*.csv
+venv_nb/
 # Keep only target Python sources by default
 *.py
 !KB.py
