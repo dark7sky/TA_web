@@ -742,6 +742,8 @@ def timechecker(last_run: datetime.datetime):
     # dbg_msg(dbg, "Last run time: " + last_run.strftime("%m-%d %H:%M:%S"))
     while True:
         ttt = datetime.datetime.now()
+        if ttt.time() >= datetime.time(23, 45):
+            return False
         if (last_run + datetime.timedelta(minutes=60)).replace(minute=0, second=0, microsecond=0) <= ttt:
             return True
         time_sleep_update_min(__name__, 5)
