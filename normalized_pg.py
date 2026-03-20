@@ -159,6 +159,35 @@ def chunked(rows: Sequence[tuple[Any, ...]], size: int = 2000) -> list[Sequence[
     return [rows[index : index + size] for index in range(0, len(rows), size)]
 
 
+def delete_redundant_account_history(cur: Any) -> int:
+    cur.execute(
+        """
+        WITH redundant_rows AS (
+            SELECT
+                account_key,
+                recorded_at
+            FROM (
+                SELECT
+                    account_key,
+                    recorded_at,
+                    balance,
+                    LAG(balance) OVER (
+                        PARTITION BY account_key
+                        ORDER BY recorded_at
+                    ) AS previous_balance
+                FROM account_balance_history
+            ) history
+            WHERE balance = previous_balance
+        )
+        DELETE FROM account_balance_history target
+        USING redundant_rows
+        WHERE target.account_key = redundant_rows.account_key
+          AND target.recorded_at = redundant_rows.recorded_at
+        """
+    )
+    return cur.rowcount
+
+
 def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     cur.execute(
         """
@@ -184,6 +213,17 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     if current_ts is not None:
         portfolio_rows.append((current_ts, total))
     return portfolio_rows
+
+
+def extend_portfolio_rows_to_now(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.datetime, int]]:
+    if not portfolio_rows:
+        return portfolio_rows
+
+    as_of = now_local().replace(microsecond=0)
+    latest_recorded_at, latest_total = portfolio_rows[-1]
+    if latest_recorded_at >= as_of:
+        return portfolio_rows
+    return [*portfolio_rows, (as_of, latest_total)]
 
 
 def build_daydiff_rows(portfolio_rows: Iterable[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
@@ -228,8 +268,9 @@ def build_monthdiff_rows(portfolio_rows: Iterable[tuple[dt.datetime, int]]) -> l
 
 def rebuild_portfolio_summaries(cur: Any) -> None:
     portfolio_rows = compute_portfolio_rows(cur)
-    daydiff_rows = build_daydiff_rows(portfolio_rows)
-    monthdiff_rows = build_monthdiff_rows(portfolio_rows)
+    portfolio_rows_for_periods = extend_portfolio_rows_to_now(portfolio_rows)
+    daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
+    monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
 
     cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
 
