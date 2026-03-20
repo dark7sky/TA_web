@@ -503,11 +503,32 @@ def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> Non
 
 
 def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> None:
-    rows = [
-        (snapshot.account_key, recorded_at, snapshot.balance, snapshot.source)
-        for snapshot in accounts.values()
-    ]
+    if not accounts:
+        return
+
+    account_keys = list(accounts)
+    cur.execute(
+        """
+        SELECT DISTINCT ON (account_key)
+            account_key,
+            balance
+        FROM account_balance_history
+        WHERE account_key = ANY(%s)
+        ORDER BY account_key, recorded_at DESC
+        """,
+        (account_keys,),
+    )
+    latest_balances = {account_key: int(balance) for account_key, balance in cur.fetchall()}
+
+    rows = []
+    for snapshot in accounts.values():
+        previous_balance = latest_balances.get(snapshot.account_key)
+        if previous_balance == snapshot.balance:
+            continue
+        rows.append((snapshot.account_key, recorded_at, snapshot.balance, snapshot.source))
+
     if not rows:
+        log("No account balance changes detected; skipped history insert.")
         return
 
     psycopg2.extras.execute_values(
@@ -613,6 +634,17 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     return portfolio_rows
 
 
+def extend_portfolio_rows_to_now(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.datetime, int]]:
+    if not portfolio_rows:
+        return portfolio_rows
+
+    as_of = now_local().replace(microsecond=0)
+    latest_recorded_at, latest_total = portfolio_rows[-1]
+    if latest_recorded_at >= as_of:
+        return portfolio_rows
+    return [*portfolio_rows, (as_of, latest_total)]
+
+
 def build_daydiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
     day_totals: dict[dt.date, int] = {}
     for recorded_at, balance in portfolio_rows:
@@ -655,8 +687,9 @@ def build_monthdiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[
 
 def rebuild_portfolio_summaries(cur: Any) -> None:
     portfolio_rows = compute_portfolio_rows(cur)
-    daydiff_rows = build_daydiff_rows(portfolio_rows)
-    monthdiff_rows = build_monthdiff_rows(portfolio_rows)
+    portfolio_rows_for_periods = extend_portfolio_rows_to_now(portfolio_rows)
+    daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
+    monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
 
     cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
 

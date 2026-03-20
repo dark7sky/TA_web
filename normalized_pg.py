@@ -60,6 +60,21 @@ def is_special_account_key(account_key: str) -> bool:
     return account_key in KNOWN_SPECIAL_KEYS or not is_numeric_account_key(account_key)
 
 
+def now_local() -> dt.datetime:
+    return dt.datetime.now(get_app_timezone())
+
+
+def append_as_of_balance_row(rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.datetime, int]]:
+    if not rows:
+        return rows
+
+    as_of = now_local().replace(microsecond=0)
+    latest_recorded_at, latest_balance = rows[-1]
+    if latest_recorded_at >= as_of:
+        return rows
+    return [*rows, (as_of, latest_balance)]
+
+
 def get_db_connection() -> Any:
     database_url = os.getenv("DATABASE_URL")
     if database_url:
@@ -159,6 +174,35 @@ def chunked(rows: Sequence[tuple[Any, ...]], size: int = 2000) -> list[Sequence[
     return [rows[index : index + size] for index in range(0, len(rows), size)]
 
 
+def delete_redundant_account_history(cur: Any) -> int:
+    cur.execute(
+        """
+        WITH redundant_rows AS (
+            SELECT
+                account_key,
+                recorded_at
+            FROM (
+                SELECT
+                    account_key,
+                    recorded_at,
+                    balance,
+                    LAG(balance) OVER (
+                        PARTITION BY account_key
+                        ORDER BY recorded_at
+                    ) AS previous_balance
+                FROM account_balance_history
+            ) history
+            WHERE balance = previous_balance
+        )
+        DELETE FROM account_balance_history target
+        USING redundant_rows
+        WHERE target.account_key = redundant_rows.account_key
+          AND target.recorded_at = redundant_rows.recorded_at
+        """
+    )
+    return cur.rowcount
+
+
 def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     cur.execute(
         """
@@ -184,6 +228,10 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     if current_ts is not None:
         portfolio_rows.append((current_ts, total))
     return portfolio_rows
+
+
+def extend_portfolio_rows_to_now(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.datetime, int]]:
+    return append_as_of_balance_row(portfolio_rows)
 
 
 def build_daydiff_rows(portfolio_rows: Iterable[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
@@ -228,8 +276,9 @@ def build_monthdiff_rows(portfolio_rows: Iterable[tuple[dt.datetime, int]]) -> l
 
 def rebuild_portfolio_summaries(cur: Any) -> None:
     portfolio_rows = compute_portfolio_rows(cur)
-    daydiff_rows = build_daydiff_rows(portfolio_rows)
-    monthdiff_rows = build_monthdiff_rows(portfolio_rows)
+    portfolio_rows_for_periods = extend_portfolio_rows_to_now(portfolio_rows)
+    daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
+    monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
 
     cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
 
@@ -369,7 +418,9 @@ def fetch_portfolio_history(cur: Any, limit: int | None = None) -> list[tuple[dt
         sql += " LIMIT %s"
         params = (limit,)
     cur.execute(sql, params)
-    return [(row[0], int(row[1])) for row in cur.fetchall()]
+    descending_rows = [(row[0], int(row[1])) for row in cur.fetchall()]
+    ascending_rows = list(reversed(descending_rows))
+    return list(reversed(append_as_of_balance_row(ascending_rows)))
 
 
 def fetch_summary_rows(cur: Any, table_name: str, limit: int = 200) -> list[tuple[Any, int]]:
@@ -383,7 +434,9 @@ def fetch_summary_rows(cur: Any, table_name: str, limit: int = 200) -> list[tupl
             """,
             (limit,),
         )
-        return [(row[0], int(row[1])) for row in cur.fetchall()]
+        descending_rows = [(row[0], int(row[1])) for row in cur.fetchall()]
+        ascending_rows = list(reversed(descending_rows))
+        return list(reversed(append_as_of_balance_row(ascending_rows)))
 
     if table_name == "accounts_daydiff":
         cur.execute(
@@ -412,19 +465,23 @@ def fetch_summary_rows(cur: Any, table_name: str, limit: int = 200) -> list[tupl
     if table_name == "accounts_diff":
         cur.execute(
             """
-            WITH diffs AS (
-                SELECT
-                    recorded_at,
-                    balance - COALESCE(LAG(balance) OVER (ORDER BY recorded_at), balance) AS diff_balance
-                FROM portfolio_balance_history
-            )
-            SELECT recorded_at, diff_balance
-            FROM diffs
+            SELECT recorded_at, balance
+            FROM portfolio_balance_history
             ORDER BY recorded_at DESC
             LIMIT %s
             """,
-            (limit,),
+            (limit + 1,),
         )
-        return [(row[0], int(row[1])) for row in cur.fetchall()]
+        descending_rows = [(row[0], int(row[1])) for row in cur.fetchall()]
+        rows = append_as_of_balance_row(list(reversed(descending_rows)))
+        diffs: list[tuple[dt.datetime, int]] = []
+        previous_balance: int | None = None
+        for recorded_at, balance in rows:
+            if previous_balance is None:
+                previous_balance = balance
+                continue
+            diffs.append((recorded_at, balance - previous_balance))
+            previous_balance = balance
+        return list(reversed(diffs[-limit:]))
 
     raise ValueError(f"Unsupported summary table alias: {table_name}")
