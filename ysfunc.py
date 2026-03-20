@@ -5,6 +5,7 @@ import datetime as dt
 from typing import Any
 
 from normalized_pg import (
+    delete_redundant_account_history,
     ensure_normalized_schema,
     get_app_timezone,
     get_db_connection,
@@ -39,11 +40,15 @@ def fetch_source_summary(cur: Any) -> dict[str, Any]:
     }
 
 
-def fetch_portfolio_summary(cur: Any) -> dict[str, int]:
-    summary: dict[str, int] = {}
+def fetch_portfolio_summary(cur: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
     for table_name in PORTFOLIO_TABLES:
         cur.execute(f"SELECT COUNT(*) FROM {table_name}")
         summary[table_name] = int(cur.fetchone()[0] or 0)
+
+    cur.execute("SELECT MIN(recorded_at), MAX(recorded_at) FROM portfolio_balance_history")
+    min_recorded_at, max_recorded_at = cur.fetchone()
+    summary["portfolio_range"] = format_timestamp_range(min_recorded_at, max_recorded_at)
     return summary
 
 
@@ -71,12 +76,18 @@ def refresh_portfolios(*, allow_empty_source: bool = False) -> dict[str, Any]:
                 "Use --allow-empty-source if an empty rebuild is intentional."
             )
 
+        deleted_history_rows = delete_redundant_account_history(cur)
+        source_summary = fetch_source_summary(cur)
+
         rebuild_portfolio_summaries(cur)
         portfolio_summary = fetch_portfolio_summary(cur)
         connection.commit()
         return {
             "source": source_summary,
             "portfolio": portfolio_summary,
+            "cleanup": {
+                "deleted_history_rows": deleted_history_rows,
+            },
         }
     except Exception:
         connection.rollback()
@@ -88,17 +99,20 @@ def refresh_portfolios(*, allow_empty_source: bool = False) -> dict[str, Any]:
 def print_refresh_result(result: dict[str, Any]) -> None:
     source = result["source"]
     portfolio = result["portfolio"]
+    cleanup = result["cleanup"]
 
     print("=== Portfolio refresh complete ===")
     print(f"Source table: {SOURCE_TABLE}")
     print(f"Source rows: {source['row_count']}")
     print(f"Accounts: {source['account_count']}")
+    print(f"Deleted redundant history rows: {cleanup['deleted_history_rows']}")
     print(
         "Recorded range: "
         f"{format_timestamp_range(source['min_recorded_at'], source['max_recorded_at'])}"
     )
     for table_name in PORTFOLIO_TABLES:
         print(f"{table_name}: {portfolio[table_name]} rows")
+    print(f"Portfolio range: {portfolio['portfolio_range']}")
 
 
 def main() -> int:
