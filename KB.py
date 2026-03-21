@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import shutil
 import datetime as dt
 import os
 import pickle
@@ -469,6 +469,18 @@ def fetch_latest_card_balance(cur: Any) -> int:
 
 
 def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accounts) -> bool:
+    source_path = r"Z:\ResilioSync\Total_Account_Tracker_210308\카드통합.xlsx"
+    if not os.path.exists(source_path):
+        print(f"⚠️ 오류: '{source_path}' 경로에 파일이 없습니다. 확인해 보세요!")
+    try:
+        # 2. 현재 폴더의 파일명 추출 (경로 제외 이름만)
+        file_name = os.path.basename(source_path)
+        # 3. 현재 폴더('.')로 복사 (이미 있으면 덮어씁니다)
+        shutil.copy2(source_path, './' + file_name)
+        print(f"✅ 성공: '{file_name}' 파일을 현재 폴더로 복사했습니다.")
+    except Exception as e:
+        # 예기치 못한 에러(권한 문제 등) 발생 시 프로그램 종료 방지
+        print(f"❌ 복사 중 에러 발생: {e}")
     refresh_cards = should_refresh_cards(last_update)
     if refresh_cards:
         log("Refreshing card balances from Excel")
