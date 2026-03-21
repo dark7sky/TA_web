@@ -64,7 +64,7 @@ def Analysis_row(vendor: str, year: int, day_column: int, row: tuple) -> bool:
     else:
         if not val.startswith(str(year)):
             return False
-        if vendor == "shinhan" and "?댁슜湲덉븸?좎씤" in str(row[2].value):
+        if vendor == "shinhan" and "이용금액할인" in str(row[2].value):
             return False
             
     return True
@@ -115,7 +115,7 @@ def Analysis_sheet(
             elif vendor_type == "2":
                 value = parse_number(row[value_column].value)
                 if len(row) > value_column + 2:
-                    if row[value_column + 2].value == "?뱀씤痍⑥냼":
+                    if row[value_column + 2].value == "승인취소":
                         value = -value
                         
             elif vendor_type == "3":
@@ -318,9 +318,9 @@ def duplicateDates(datas: List[list]) -> List[list]:
 
 
 def _correct_pickle_years(key: str, data: List[list]) -> List[list]:
-    """Pre-2000 ?좎쭨瑜??쒗듃紐낆뿉????궛???곕룄濡??뺤젙?쒕떎.
+    """Pre-2000 날짜를 시트명에서 역산한 연도로 정정한다.
 
-    ?덉떆: '?곕━2312' ??year=2023, '?곕━2401' ??year=2024
+    예시: '우리2312' → year=2023, '우리2401' → year=2024
     """
     try:
         correct_year = 2000 + int(key[-4:-2])
@@ -333,7 +333,7 @@ def _correct_pickle_years(key: str, data: List[list]) -> List[list]:
         if dt.year < 2000:
             try:
                 fixed_dt = dt.replace(year=correct_year)
-                logs.warning(f"pickle '{key}': ?좎쭨 蹂댁젙 {dt.strftime('%m-%d %H:%M:%S')} ??{fixed_dt}")
+                logs.warning(f"pickle '{key}': 날짜 보정 {dt.strftime('%m-%d %H:%M:%S')} → {fixed_dt}")
                 result.append([fixed_dt, val])
             except ValueError:
                 result.append(entry)  # 蹂댁젙 遺덇? ???먮낯 ?좎?
@@ -342,7 +342,7 @@ def _correct_pickle_years(key: str, data: List[list]) -> List[list]:
     return result
 
 
-def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
+def main(cur: Any, filepath_exel: str = "카드통합.xlsx") -> None:
     """Main card integration pipeline."""
     datas: List[list] = []
 
@@ -356,7 +356,7 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
     try:
         wb = openpyxl.load_workbook(filepath_exel)
     except Exception as e:
-        logs.error(f"Excel 濡쒕뱶 ?ㅽ뙣 ({filepath_exel}): {e}")
+        logs.error(f"Excel 로드 실패 ({filepath_exel}): {e}")
         raise
 
     logs.msg("Processing sheets")
@@ -378,10 +378,10 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
         data = card_analysis(sheetname, ws)
 
         if isinstance(data, tuple) and data[0] == "ERROR":
-            logs.warning(f"Sheet {sheetname} ?ㅽ궢?? {data[1]}")
+            logs.warning(f"Sheet {sheetname} 스킵됨 {data[1]}")
             continue
 
-        # 1900?꾨? ?좎쭨瑜??쒗듃紐낆쑝濡?蹂댁젙 (?좉퇋 遺꾩꽍 ?곗씠?곕룄 defensive 泥댄겕)
+        # 1900년대 날짜를 시트명으로 보정 (신규 분석 데이터도 defensive 체크)
         clean_data = _correct_pickle_years(sheetname, list(data))  # type: ignore
 
         pickleData[sheetname] = copy.copy(clean_data)
@@ -411,7 +411,7 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
         except ValueError:
             pass # Keep if filename parse fails
             
-    # pickle ?????湲곗〈 罹먯떆??蹂댁젙 (?ㅼ쓬 ?ㅽ뻾遺???щ컮瑜??곗씠???ъ슜)
+    # pickle 저장 전 기존 캐시도 보정 (다음 실행부터 올바른 데이터 사용)
     for key in list(pickleData.keys()):
         pickleData[key] = _correct_pickle_years(key, pickleData[key])
 
@@ -423,7 +423,7 @@ def main(cur: Any, filepath_exel: str = "移대뱶?듯빀.xlsx") -> None:
 
 
     totals = sum(d[1] for d in datas)
-    print(f"\n珥?湲덉븸 ?⑷퀎 泥댄겕: {totals}")
+    print(f"\n총 금액 합계 체크: {totals}")
     if totals != 0:
         err_msg = f"[aborted] Calculation mismatch. Please check again... {totals}"
         logs.error(err_msg)
@@ -519,6 +519,6 @@ if __name__ == "__main__":
         # Uncomment to commit manually when running standalone
         # con.commit()
     except Exception as e:
-        logs.error(f"?ㅽ뻾 以?援ъ“???먮윭 諛쒖깮: {e}")
+        logs.error(f"실행 중 구조적 에러 발생: {e}")
     finally:
         con.close()
