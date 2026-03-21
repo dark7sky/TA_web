@@ -34,11 +34,13 @@ FILE_CREON = "CREON.pickle"
 FILE_CARD_PICKLE = "cards.pickle"
 FILE_CARD_EXCEL = "카드통합.xlsx"
 MANUAL_INPUTS_TABLE = "manual_inputs"
+SYSTEM_SETTINGS_TABLE = "system_settings"
 APP_TIMEZONE_ENV = "APP_TIMEZONE"
 CREON_ACCOUNT_NUMBER = os.getenv("CREON_ACCOUNT_NUMBER")
 EXCEPTION_BANKS_ENV = "EXCEPTION_BANKS"
 EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
 USE_TQDM = True
+TA_WEB_LAST_CRAWLED_AT_KEY = "ta_web_last_crawled_at"
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
     "toss",
@@ -187,6 +189,14 @@ def ensure_normalized_schema(cur: Any) -> None:
             PRIMARY KEY (account_key, recorded_at)
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {SYSTEM_SETTINGS_TABLE} (
+            id SERIAL PRIMARY KEY,
+            setting_key VARCHAR(100) UNIQUE NOT NULL,
+            setting_value JSON NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
         """
         CREATE TABLE IF NOT EXISTS portfolio_balance_history (
             recorded_at TIMESTAMPTZ PRIMARY KEY,
@@ -213,6 +223,36 @@ def ensure_normalized_schema(cur: Any) -> None:
     ]
     for statement in statements:
         cur.execute(statement)
+
+
+def upsert_system_setting(cur: Any, setting_key: str, setting_value: Any) -> None:
+    cur.execute(
+        f"""
+        INSERT INTO {SYSTEM_SETTINGS_TABLE} (setting_key, setting_value)
+        VALUES (%s, %s)
+        ON CONFLICT (setting_key) DO UPDATE SET
+            setting_value = EXCLUDED.setting_value,
+            updated_at = now()
+        """,
+        (setting_key, psycopg2.extras.Json(setting_value)),
+    )
+
+
+def write_crawl_heartbeat(
+    cur: Any,
+    *,
+    recorded_at: dt.datetime,
+    account_count: int,
+) -> None:
+    upsert_system_setting(
+        cur,
+        TA_WEB_LAST_CRAWLED_AT_KEY,
+        {
+            "crawled_at": recorded_at.isoformat(),
+            "account_count": account_count,
+            "source": "KB.py",
+        },
+    )
 
 
 def merge_snapshot(accounts: Accounts, snapshot: AccountSnapshot, additive: bool = False) -> None:
@@ -771,6 +811,13 @@ def KB_main() -> bool | tuple[str, Exception]:
 
         log("=== Rebuild portfolio summaries ===")
         rebuild_portfolio_summaries(cur)
+
+        log("=== Record crawl heartbeat ===")
+        write_crawl_heartbeat(
+            cur,
+            recorded_at=recorded_at,
+            account_count=len(filtered_accounts),
+        )
 
         connection.commit()
         cur.close()
