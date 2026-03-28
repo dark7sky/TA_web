@@ -47,8 +47,8 @@ DEFAULT_WAIT_MS = DEFAULT_WAIT_SECONDS * 1000
 SHORT_SLEEP_SECONDS = 1
 MANUAL_LOGIN_TIMEOUT_SECONDS = 300
 HEARTBEAT_INTERVAL_SECONDS = 120
-MAX_COOKIE_LOAD_RETRIES = 3
 MAX_SERVICE_RETRIES = 6
+MAX_LOGIN_LOOP_COUNT = 3
 STOP_AFTER_TIME = dt.time(23, 45)
 
 COOKIE_FILE = Path("cookie_KB.pickle")
@@ -246,6 +246,11 @@ class RuntimeState:
     notifier: Optional[simpleTelegram] = None
     websocket: Any = None
     silent_shutdown: bool = False
+    login_loop_count: int = 0
+
+
+class LoginRetryLimitReached(RuntimeError):
+    pass
 
 
 @dataclass
@@ -284,11 +289,22 @@ class PlaywrightSession:
             "user_agent": normalize_user_agent(self.user_agent),
         }
 
-        try:
-            self.context = self.playwright.chromium.launch_persistent_context(**common_kwargs)
-            self.browser_channel = "chromium"
-        except Exception as exc:
-            raise RuntimeError(f"Unable to launch Playwright Chromium browser :: {exc}") from exc
+        launch_errors: list[str] = []
+        for browser_name, browser_channel in (("chromium", None), ("chrome", "chrome")):
+            try:
+                kwargs = dict(common_kwargs)
+                if browser_channel is not None:
+                    kwargs["channel"] = browser_channel
+                self.context = self.playwright.chromium.launch_persistent_context(**kwargs)
+                self.browser_channel = browser_name
+                break
+            except Exception as exc:
+                launch_errors.append(f"{browser_name} :: {exc}")
+
+        if self.context is None:
+            raise RuntimeError(
+                "Unable to launch Playwright browser: " + " | ".join(launch_errors)
+            )
 
         self.context.set_default_timeout(DEFAULT_WAIT_MS)
         self.context.set_default_navigation_timeout(DEFAULT_WAIT_MS)
@@ -381,6 +397,25 @@ def report_progress(runtime: RuntimeState, step_name: str, minutes: int) -> None
             return
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
         elapsed += HEARTBEAT_INTERVAL_SECONDS // 60
+
+
+def reset_login_loop_count(runtime: Optional[RuntimeState]) -> None:
+    if runtime is None:
+        return
+    runtime.login_loop_count = 0
+
+
+def increase_login_loop_count(runtime: RuntimeState, exc: Exception) -> None:
+    runtime.login_loop_count += 1
+    log_message(
+        f"KB login failed ({runtime.login_loop_count}/{MAX_LOGIN_LOOP_COUNT}) :: {exc}"
+    )
+    if runtime.login_loop_count >= MAX_LOGIN_LOOP_COUNT:
+        message = (
+            f"KB login failed {runtime.login_loop_count} times in a row; stopping service"
+        )
+        log_message(message, send=True)
+        raise LoginRetryLimitReached(message)
 
 
 def should_continue_service(last_run: dt.datetime, runtime: RuntimeState) -> bool:
@@ -506,9 +541,12 @@ def run_login_process(
             raise RuntimeError("KB login failed")
 
         session.save_cookies(config.cookie_file, config.url_main)
+        reset_login_loop_count(runtime)
         return True
     except Exception as exc:
         log_message(f"Function KB_login_process => Failed :: {exc}")
+        if runtime is not None:
+            increase_login_loop_count(runtime, exc)
         return False
     finally:
         if original_headless and not session.headless:
@@ -523,23 +561,23 @@ def load_or_create_cookies(
     config: KBConfig,
     runtime: RuntimeState,
 ) -> list[dict[str, Any]]:
-    for attempt in range(1, MAX_COOKIE_LOAD_RETRIES + 1):
-        try:
-            cookies = load_pickle(config.cookie_file)
-            if isinstance(cookies, list):
-                return cookies
-            raise TypeError("cookie file does not contain a list")
-        except Exception as exc:
-            log_message(
-                f"No cookie found or load failed (trial {attempt}/{MAX_COOKIE_LOAD_RETRIES}) :: {exc}"
-            )
-            if not run_login_process(session, config, runtime):
-                continue
-    raise RuntimeError("cookie load failed")
+    try:
+        cookies = load_pickle(config.cookie_file)
+        if isinstance(cookies, list):
+            return cookies
+        raise TypeError("cookie file does not contain a list")
+    except FileNotFoundError:
+        log_message("No cookie found; continuing without saved cookies")
+        return []
+    except Exception as exc:
+        log_message(f"Cookie load failed; continuing without saved cookies :: {exc}")
+        return []
 
 
 def restore_cookies(session: PlaywrightSession, config: KBConfig, cookies: list[dict[str, Any]]) -> None:
     page = session.goto(config.url_main)
+    if not cookies:
+        return
     session.add_cookies(cookies, config.url_main)
     page.reload(wait_until="domcontentloaded", timeout=DEFAULT_WAIT_MS)
 
@@ -547,12 +585,16 @@ def restore_cookies(session: PlaywrightSession, config: KBConfig, cookies: list[
 def ensure_logged_in(session: PlaywrightSession, config: KBConfig, runtime: RuntimeState) -> None:
     session.goto(config.url_main)
     if is_logged_in(session):
+        reset_login_loop_count(runtime)
         return
     if not run_login_process(session, config, runtime):
         raise RuntimeError("KB login failed")
     session.goto(config.url_main)
     if not is_logged_in(session):
-        raise RuntimeError("KB login failed after relaunch")
+        login_error = RuntimeError("KB login failed after relaunch")
+        increase_login_loop_count(runtime, login_error)
+        raise login_error
+    reset_login_loop_count(runtime)
 
 
 def open_openbank_page(session: PlaywrightSession) -> Page:
@@ -674,6 +716,8 @@ def run_collection_cycle(session: PlaywrightSession, config: KBConfig, runtime: 
             lambda: save_collection_results(session, config, collected_rows),
         )
         return True
+    except LoginRetryLimitReached:
+        raise
     except Exception:
         return False
 
@@ -738,7 +782,13 @@ def main() -> bool:
         last_run = dt.datetime.now()
         refresh_watchdog_connection(config, runtime)
 
-        if not run_collection_cycle(session, config, runtime):
+        try:
+            cycle_completed = run_collection_cycle(session, config, runtime)
+        except LoginRetryLimitReached:
+            runtime.silent_shutdown = True
+            return False
+
+        if not cycle_completed:
             log_message("KB check 실패")
             continue
 
