@@ -54,7 +54,6 @@ STOP_AFTER_TIME = dt.time(23, 45)
 COOKIE_FILE = Path("cookie_KB.pickle")
 OPENBANK_PICKLE_FILE = Path("KB.pickle")
 WS_CONFIG_FILE = Path("ws.config")
-DEBUG_FILE = Path("debug")
 DEFAULT_USER_DATA_DIR = Path("Chrome")
 
 LOGIN_FRAME_SELECTOR = 'iframe[name="LOGN010001-contentsFrame"]'
@@ -193,7 +192,6 @@ class KBConfig:
     users_id: str
     vm_qm_id: str
     chrome_user_data_dir: str
-    headless: bool
     url_main: str = DEFAULT_MAIN_URL
     url_login: str = DEFAULT_LOGIN_URL
     user_agent: str = DEFAULT_USER_AGENT
@@ -217,7 +215,6 @@ class KBConfig:
                 "CHROME_USER_DATA_DIR",
                 str(DEFAULT_USER_DATA_DIR.resolve()),
             ),
-            headless=not DEBUG_FILE.is_file(),
         )
         config.validate()
         return config
@@ -266,13 +263,11 @@ class PlaywrightSession:
     def start(self) -> None:
         if self.playwright is None:
             self.playwright = sync_playwright().start()
-        self.launch(self.headless)
+        self.launch()
 
-    def launch(self, launch_headless: Optional[bool] = None) -> None:
+    def launch(self) -> None:
         if self.playwright is None:
             self.playwright = sync_playwright().start()
-        if launch_headless is not None:
-            self.headless = launch_headless
         if self.context is not None:
             try:
                 self.context.close()
@@ -311,9 +306,6 @@ class PlaywrightSession:
         self.context.on("page", self._register_page)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self._register_page(self.page)
-
-    def relaunch(self, launch_headless: bool) -> None:
-        self.launch(launch_headless)
 
     def current_page(self) -> Page:
         if self.page is None:
@@ -527,12 +519,8 @@ def run_login_process(
     config: KBConfig,
     runtime: Optional[RuntimeState] = None,
 ) -> bool:
-    original_headless = session.headless
     try:
         log_message("KB login required", send=True)
-        if original_headless:
-            log_message("Switching to headed Playwright session for KB login")
-            session.relaunch(False)
 
         if runtime is not None:
             report_progress(runtime, "KB_login_process", 0)
@@ -548,12 +536,6 @@ def run_login_process(
         if runtime is not None:
             increase_login_loop_count(runtime, exc)
         return False
-    finally:
-        if original_headless and not session.headless:
-            try:
-                session.relaunch(True)
-            except Exception as exc:
-                log_message(f"Failed to relaunch headless Playwright session :: {exc}")
 
 
 def load_or_create_cookies(
@@ -764,12 +746,11 @@ def main() -> bool:
     runtime = setup_runtime(config)
     log_message("KB 프로그램 시작", send=True)
     log_message("1. Prepare Playwright browser")
-    if not config.headless:
-        log_message("debug 파일 존재::: DEBUG 모드")
+    log_message("Playwright headed mode enabled")
 
     session = PlaywrightSession(
         user_data_dir=config.chrome_user_data_dir,
-        headless=config.headless,
+        headless=False,
         user_agent=config.user_agent,
     )
     session.start()
