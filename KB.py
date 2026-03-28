@@ -1,10 +1,12 @@
 from __future__ import annotations
-import shutil
+
 import datetime as dt
 import os
 import pickle
+import shutil
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -15,32 +17,31 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 import logger
-from KB_web import all_datas
 
 load_dotenv()
 
-logs = logger.logger(os.path.basename(__file__).split(".")[0])
+logs = logger.logger(Path(__file__).stem)
 
 
-def log(msg: str) -> None:
-    logs.msg(msg)
+def log(message: str) -> None:
+    logs.msg(message)
 
 
-FILE_LAST_UPDATE = ".last_update.pickle"
-FILE_LAST_UPDATE_BK = ".last_update_bk.pickle"
-FILE_KB_PICKLE = "KB.pickle"
-FILE_KBSELF_PICKLE = "KBself.pickle"
-FILE_CREON = "CREON.pickle"
-FILE_CARD_PICKLE = "cards.pickle"
-FILE_CARD_EXCEL = "카드통합.xlsx"
+FILE_LAST_UPDATE = Path(".last_update.pickle")
+FILE_LAST_UPDATE_BK = Path(".last_update_bk.pickle")
+FILE_KB_PICKLE = Path("KB.pickle")
+FILE_CARD_PICKLE = Path("cards.pickle")
+FILE_CARD_EXCEL = Path("카드통합.xlsx")
+SYNCED_CARD_EXCEL = Path(r"Z:/ResilioSync/Total_Account_Tracker_210308/카드통합.xlsx")
+
 MANUAL_INPUTS_TABLE = "manual_inputs"
 SYSTEM_SETTINGS_TABLE = "system_settings"
 APP_TIMEZONE_ENV = "APP_TIMEZONE"
-CREON_ACCOUNT_NUMBER = os.getenv("CREON_ACCOUNT_NUMBER")
 EXCEPTION_BANKS_ENV = "EXCEPTION_BANKS"
 EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
-USE_TQDM = True
 TA_WEB_LAST_CRAWLED_AT_KEY = "ta_web_last_crawled_at"
+USE_TQDM = True
+
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
     "toss",
@@ -50,6 +51,13 @@ KNOWN_SPECIAL_KEYS = {
     "외화",
     "지역화폐",
     "장기수선충당금",
+}
+
+MANUAL_KEY_ALIASES = {
+    "랩비": "lab_private",
+    "toss증권": "toss",
+    "대출": "debt",
+    "보험": "insurance",
 }
 
 
@@ -63,6 +71,22 @@ class AccountSnapshot:
     memo: str = ""
     is_special: bool = False
     source: str = "kb"
+
+
+@dataclass(frozen=True)
+class ExclusionRules:
+    banks: frozenset[str]
+    accounts: frozenset[str]
+
+    def excludes(self, account_key: str, company: str) -> bool:
+        return account_key in self.accounts or company in self.banks
+
+
+@dataclass
+class RunContext:
+    recorded_at: dt.datetime
+    last_update: dict[str, float]
+    exclusions: ExclusionRules
 
 
 Accounts = dict[str, AccountSnapshot]
@@ -91,43 +115,50 @@ def now_local() -> dt.datetime:
 
 
 def parse_env_csv(key: str) -> list[str]:
-    raw = os.getenv(key, "")
-    if raw in (None, ""):
+    raw_value = os.getenv(key, "")
+    if raw_value in (None, ""):
         return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
-def load_exceptions() -> dict[str, list[str]]:
-    return {
-        "bank": parse_env_csv(EXCEPTION_BANKS_ENV),
-        "accounts": parse_env_csv(EXCEPTION_ACCOUNTS_ENV),
-    }
+def load_exclusion_rules() -> ExclusionRules:
+    return ExclusionRules(
+        banks=frozenset(parse_env_csv(EXCEPTION_BANKS_ENV)),
+        accounts=frozenset(parse_env_csv(EXCEPTION_ACCOUNTS_ENV)),
+    )
 
 
-def lst_udt(operation: str = "read", last_update: dict[str, float] | None = None) -> dict[str, float] | bool:
-    last_update = last_update or {}
-    if operation == "read":
-        try:
-            with open(FILE_LAST_UPDATE, "rb") as file_obj:
-                return pickle.load(file_obj)
-        except FileNotFoundError:
-            log(f"{FILE_LAST_UPDATE} not found; using defaults.")
-            return {"KB": 0.0}
-        except pickle.UnpicklingError:
-            log(f"{FILE_LAST_UPDATE} is corrupt; loading backup.")
-            with open(FILE_LAST_UPDATE_BK, "rb") as file_obj:
-                return pickle.load(file_obj)
+def default_last_update_state() -> dict[str, float]:
+    return {"KB": 0.0}
 
-    if operation == "save":
-        try:
-            with open(FILE_LAST_UPDATE, "wb") as file_obj:
-                pickle.dump(last_update, file_obj)
-            return True
-        except Exception as exc:
-            log(f"Error saving {FILE_LAST_UPDATE}: {exc}")
-            return False
 
-    return False
+def load_last_update_state() -> dict[str, float]:
+    try:
+        with FILE_LAST_UPDATE.open("rb") as file_obj:
+            loaded = pickle.load(file_obj)
+        if isinstance(loaded, dict):
+            return loaded
+        raise TypeError(f"{FILE_LAST_UPDATE} must contain a dict")
+    except FileNotFoundError:
+        log(f"{FILE_LAST_UPDATE} not found; using defaults.")
+        return default_last_update_state()
+    except pickle.UnpicklingError:
+        log(f"{FILE_LAST_UPDATE} is corrupt; loading backup.")
+        with FILE_LAST_UPDATE_BK.open("rb") as file_obj:
+            loaded = pickle.load(file_obj)
+        if isinstance(loaded, dict):
+            return loaded
+        raise TypeError(f"{FILE_LAST_UPDATE_BK} must contain a dict")
+
+
+def save_last_update_state(last_update: dict[str, float]) -> bool:
+    try:
+        with FILE_LAST_UPDATE.open("wb") as file_obj:
+            pickle.dump(last_update, file_obj)
+        return True
+    except Exception as exc:
+        log(f"Error saving {FILE_LAST_UPDATE}: {exc}")
+        return False
 
 
 def parse_int_value(raw_value: Any) -> int | None:
@@ -238,12 +269,7 @@ def upsert_system_setting(cur: Any, setting_key: str, setting_value: Any) -> Non
     )
 
 
-def write_crawl_heartbeat(
-    cur: Any,
-    *,
-    recorded_at: dt.datetime,
-    account_count: int,
-) -> None:
+def write_crawl_heartbeat(cur: Any, recorded_at: dt.datetime, account_count: int) -> None:
     upsert_system_setting(
         cur,
         TA_WEB_LAST_CRAWLED_AT_KEY,
@@ -272,25 +298,16 @@ def merge_snapshot(accounts: Accounts, snapshot: AccountSnapshot, additive: bool
     if snapshot.memo:
         existing.memo = snapshot.memo
     existing.is_special = existing.is_special or snapshot.is_special
-    if additive:
-        existing.balance += snapshot.balance
-    else:
-        existing.balance = snapshot.balance
+    existing.balance = existing.balance + snapshot.balance if additive else snapshot.balance
     if snapshot.source:
         existing.source = snapshot.source
 
 
 def normalize_manual_key(raw_key: str) -> tuple[str, str | None]:
-    key_aliases = {
-        "랩비": "lab_private",
-        "toss증권": "toss",
-        "대출": "debt",
-        "보험": "insurance",
-    }
     if "@" in raw_key:
         head, *tail = raw_key.split("@")
-        return key_aliases.get(head, head), "".join(tail) or None
-    return key_aliases.get(raw_key, raw_key), None
+        return MANUAL_KEY_ALIASES.get(head, head), "".join(tail) or None
+    return MANUAL_KEY_ALIASES.get(raw_key, raw_key), None
 
 
 def build_special_snapshot(account_key: str, balance: int, source: str, memo: str = "") -> AccountSnapshot:
@@ -306,8 +323,35 @@ def build_special_snapshot(account_key: str, balance: int, source: str, memo: st
     )
 
 
-def load_openbank_accounts(exceptions: dict[str, list[str]]) -> Accounts:
-    with open(FILE_KB_PICKLE, "rb") as file_obj:
+def parse_openbank_row(row: Any, exclusions: ExclusionRules) -> AccountSnapshot | None:
+    if not isinstance(row, (list, tuple)) or len(row) < 5:
+        log(f"Skip malformed KB row: {row!r}")
+        return None
+
+    company = str(row[0]).strip()
+    account_type = str(row[1]).strip()
+    account_key = str(row[2]).strip()
+    name = str(row[3]).strip() or account_key
+    balance = parse_int_value(row[4])
+
+    if not account_key or balance is None:
+        log(f"Skip KB row with invalid account or balance: {row!r}")
+        return None
+    if exclusions.excludes(account_key, company):
+        return None
+
+    return AccountSnapshot(
+        account_key=account_key,
+        balance=balance,
+        company=company,
+        account_type=account_type,
+        name=name,
+        source="kb_openbank",
+    )
+
+
+def load_openbank_accounts(exclusions: ExclusionRules) -> Accounts:
+    with FILE_KB_PICKLE.open("rb") as file_obj:
         loaded = pickle.load(file_obj)
 
     if not isinstance(loaded, list):
@@ -315,75 +359,16 @@ def load_openbank_accounts(exceptions: dict[str, list[str]]) -> Accounts:
 
     accounts: Accounts = {}
     for row in loaded:
-        if not isinstance(row, (list, tuple)) or len(row) < 5:
-            log(f"Skip malformed KB row: {row!r}")
-            continue
-        company = str(row[0]).strip()
-        account_type = str(row[1]).strip()
-        account_key = str(row[2]).strip()
-        name = str(row[3]).strip() or account_key
-        balance = parse_int_value(row[4])
-        if not account_key or balance is None:
-            log(f"Skip KB row with invalid account or balance: {row!r}")
-            continue
-        if company in exceptions.get("bank", []):
-            continue
-        if account_key in exceptions.get("accounts", []):
-            continue
-        merge_snapshot(
-            accounts,
-            AccountSnapshot(
-                account_key=account_key,
-                balance=balance,
-                company=company,
-                account_type=account_type,
-                name=name,
-                source="kb_openbank",
-            ),
-        )
+        snapshot = parse_openbank_row(row, exclusions)
+        if snapshot is not None:
+            merge_snapshot(accounts, snapshot)
     return accounts
-
-
-def load_kb_securities(accounts: Accounts) -> None:
-    try:
-        with open(FILE_KBSELF_PICKLE, "rb") as file_obj:
-            loaded = pickle.load(file_obj)
-    except FileNotFoundError:
-        log(f"{FILE_KBSELF_PICKLE} not found; skipping KB securities.")
-        return
-
-    if not isinstance(loaded, dict):
-        raise TypeError(f"{FILE_KBSELF_PICKLE} must contain a dict")
-
-    for raw_key in all_datas.get("KBaccounts", []):
-        account_key = str(raw_key).strip()
-        if not account_key:
-            continue
-        raw_balance = loaded.get(account_key, 0)
-        balance = parse_int_value(raw_balance)
-        if balance is None:
-            log(f"Skip KB securities row with invalid balance: {account_key}={raw_balance!r}")
-            continue
-        if account_key not in loaded:
-            log(f"KB stock account not found ({account_key})")
-        existing = accounts.get(account_key)
-        merge_snapshot(
-            accounts,
-            AccountSnapshot(
-                account_key=account_key,
-                balance=balance,
-                company="KB증권" if existing is None else "",
-                account_type="종합위탁" if existing is None else "",
-                name="KB주식투자계좌" if existing is None else "",
-                source="kb_securities",
-            ),
-        )
 
 
 def apply_manual_inputs_from_db(cur: Any, accounts: Accounts) -> None:
     try:
         cur.execute(
-            f"SELECT key_name, value FROM \"{MANUAL_INPUTS_TABLE}\" ORDER BY key_name"
+            f'SELECT key_name, value FROM "{MANUAL_INPUTS_TABLE}" ORDER BY key_name'
         )
     except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable) as exc:
         log(f"{MANUAL_INPUTS_TABLE} is not ready: {exc}")
@@ -399,6 +384,7 @@ def apply_manual_inputs_from_db(cur: Any, accounts: Accounts) -> None:
         if value is None:
             log(f"Skip manual input with non-numeric value: {key_name}={raw_value!r}")
             continue
+
         account_key, label = normalize_manual_key(key_name)
         snapshot = build_special_snapshot(
             account_key=account_key,
@@ -409,44 +395,17 @@ def apply_manual_inputs_from_db(cur: Any, accounts: Accounts) -> None:
         merge_snapshot(accounts, snapshot, additive="@" in key_name)
 
 
-def apply_creon_balance(accounts: Accounts) -> None:
-    if CREON_ACCOUNT_NUMBER in (None, ""):
-        raise RuntimeError("CREON_ACCOUNT_NUMBER is missing in the environment")
-    try:
-        with open(FILE_CREON, "rb") as file_obj:
-            raw_balance = pickle.load(file_obj)
-    except FileNotFoundError:
-        raw_balance = 0
-
-    balance = parse_int_value(raw_balance)
-    if balance is None:
-        raise ValueError(f"{FILE_CREON} does not contain an int-like value")
-
-    existing = accounts.get(CREON_ACCOUNT_NUMBER)
-    merge_snapshot(
-        accounts,
-        AccountSnapshot(
-            account_key=CREON_ACCOUNT_NUMBER,
-            balance=balance,
-            company="" if existing else "CREON",
-            account_type="" if existing else "Brokerage",
-            name="" if existing else "CREON",
-            source="creon",
-        ),
-    )
-
-
 def should_refresh_cards(last_update: dict[str, float]) -> bool:
-    if not os.path.isfile(FILE_CARD_EXCEL):
+    if not FILE_CARD_EXCEL.is_file():
         return False
     if "cards" not in last_update:
         return True
-    if not os.path.isfile(FILE_CARD_PICKLE):
+    if not FILE_CARD_PICKLE.is_file():
         return True
-    card_pickle_date = dt.date.fromtimestamp(os.path.getmtime(FILE_CARD_PICKLE))
+    card_pickle_date = dt.date.fromtimestamp(FILE_CARD_PICKLE.stat().st_mtime)
     if card_pickle_date != now_local().date():
         return True
-    return os.path.getmtime(FILE_CARD_EXCEL) != last_update["cards"]
+    return FILE_CARD_EXCEL.stat().st_mtime != last_update["cards"]
 
 
 def fetch_latest_card_balance(cur: Any) -> int:
@@ -468,24 +427,25 @@ def fetch_latest_card_balance(cur: Any) -> int:
         return 0
 
 
-def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accounts) -> bool:
-    source_path = r"Z:\ResilioSync\Total_Account_Tracker_210308\카드통합.xlsx"
-    if not os.path.exists(source_path):
-        print(f"⚠️ 오류: '{source_path}' 경로에 파일이 없습니다. 확인해 보세요!")
+def sync_card_excel() -> None:
+    if not SYNCED_CARD_EXCEL.exists():
+        log(f"Card Excel source missing: {SYNCED_CARD_EXCEL}")
+        return
     try:
-        # 2. 현재 폴더의 파일명 추출 (경로 제외 이름만)
-        file_name = os.path.basename(source_path)
-        # 3. 현재 폴더('.')로 복사 (이미 있으면 덮어씁니다)
-        shutil.copy2(source_path, './' + file_name)
-        print(f"✅ 성공: '{file_name}' 파일을 현재 폴더로 복사했습니다.")
-    except Exception as e:
-        # 예기치 못한 에러(권한 문제 등) 발생 시 프로그램 종료 방지
-        print(f"❌ 복사 중 에러 발생: {e}")
+        shutil.copy2(SYNCED_CARD_EXCEL, FILE_CARD_EXCEL)
+        log(f"Copied card Excel: {SYNCED_CARD_EXCEL.name}")
+    except Exception as exc:
+        log(f"Failed to copy card Excel: {exc}")
+
+
+def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accounts) -> bool:
+    sync_card_excel()
+
     refresh_cards = should_refresh_cards(last_update)
     if refresh_cards:
         log("Refreshing card balances from Excel")
-        cards.main(cur, filepath_exel=FILE_CARD_EXCEL)
-        last_update["cards"] = os.path.getmtime(FILE_CARD_EXCEL)
+        cards.main(cur, filepath_exel=str(FILE_CARD_EXCEL))
+        last_update["cards"] = FILE_CARD_EXCEL.stat().st_mtime
     else:
         log("Using latest stored card balance")
 
@@ -508,18 +468,16 @@ def validate_total(accounts: Accounts) -> None:
         raise ValueError("Total below 150,000,000; aborting as suspicious")
 
 
-def filter_accounts(accounts: Accounts, exceptions: dict[str, list[str]]) -> Accounts:
-    excluded_accounts = set(exceptions.get("accounts", []))
-    excluded_banks = set(exceptions.get("bank", []))
+def filter_accounts(accounts: Accounts, exclusions: ExclusionRules) -> Accounts:
     return {
         key: snapshot
         for key, snapshot in accounts.items()
-        if key not in excluded_accounts and snapshot.company not in excluded_banks
+        if not exclusions.excludes(key, snapshot.company)
     }
 
 
-def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> None:
-    rows = []
+def build_account_rows(accounts: Accounts, is_active: bool) -> list[tuple[Any, ...]]:
+    rows: list[tuple[Any, ...]] = []
     for snapshot in accounts.values():
         rows.append(
             (
@@ -532,6 +490,11 @@ def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> Non
                 is_active,
             )
         )
+    return rows
+
+
+def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> None:
+    rows = build_account_rows(accounts, is_active)
     if not rows:
         return
 
@@ -554,11 +517,10 @@ def upsert_accounts(cur: Any, accounts: Accounts, is_active: bool = True) -> Non
     )
 
 
-def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> None:
-    if not accounts:
-        return
+def fetch_latest_balances(cur: Any, account_keys: list[str]) -> dict[str, int]:
+    if not account_keys:
+        return {}
 
-    account_keys = list(accounts)
     cur.execute(
         """
         SELECT DISTINCT ON (account_key)
@@ -570,15 +532,29 @@ def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetim
         """,
         (account_keys,),
     )
-    latest_balances = {account_key: int(balance) for account_key, balance in cur.fetchall()}
+    return {account_key: int(balance) for account_key, balance in cur.fetchall()}
 
-    rows = []
+
+def build_history_rows(
+    accounts: Accounts,
+    latest_balances: dict[str, int],
+    recorded_at: dt.datetime,
+) -> list[tuple[str, dt.datetime, int, str]]:
+    rows: list[tuple[str, dt.datetime, int, str]] = []
     for snapshot in accounts.values():
         previous_balance = latest_balances.get(snapshot.account_key)
         if previous_balance == snapshot.balance:
             continue
         rows.append((snapshot.account_key, recorded_at, snapshot.balance, snapshot.source))
+    return rows
 
+
+def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> None:
+    if not accounts:
+        return
+
+    latest_balances = fetch_latest_balances(cur, list(accounts))
+    rows = build_history_rows(accounts, latest_balances, recorded_at)
     if not rows:
         log("No account balance changes detected; skipped history insert.")
         return
@@ -601,7 +577,7 @@ def zero_out_missing_accounts(
     cur: Any,
     current_accounts: Accounts,
     recorded_at: dt.datetime,
-    exceptions: dict[str, list[str]],
+    exclusions: ExclusionRules,
 ) -> None:
     cur.execute(
         """
@@ -621,12 +597,10 @@ def zero_out_missing_accounts(
         """
     )
 
-    excluded_accounts = set(exceptions.get("accounts", []))
-    excluded_banks = set(exceptions.get("bank", []))
-    rows_to_insert = []
-    zeroed_accounts = []
+    rows_to_insert: list[tuple[str, dt.datetime, int, str]] = []
+    zeroed_accounts: list[str] = []
     for account_key, company, latest_balance in cur.fetchall():
-        if account_key in excluded_accounts or company in excluded_banks:
+        if exclusions.excludes(account_key, company):
             continue
         if account_key in current_accounts:
             continue
@@ -648,6 +622,7 @@ def zero_out_missing_accounts(
             """,
             rows_to_insert,
         )
+
     if zeroed_accounts:
         cur.execute(
             "UPDATE accounts SET is_active = FALSE, updated_at = now() WHERE account_key = ANY(%s)",
@@ -655,7 +630,7 @@ def zero_out_missing_accounts(
         )
 
 
-def chunked(rows: list[tuple], size: int = 2000) -> list[list[tuple]]:
+def chunked(rows: list[tuple[Any, ...]], size: int = 2000) -> list[list[tuple[Any, ...]]]:
     return [rows[index : index + size] for index in range(0, len(rows), size)]
 
 
@@ -669,20 +644,20 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
     )
     latest_by_account: dict[str, int] = {}
     total = 0
-    current_ts: dt.datetime | None = None
+    current_timestamp: dt.datetime | None = None
     portfolio_rows: list[tuple[dt.datetime, int]] = []
 
     for account_key, recorded_at, balance in progress_iter(cur.fetchall(), desc="portfolio_totals"):
-        if current_ts is not None and recorded_at != current_ts:
-            portfolio_rows.append((current_ts, total))
+        if current_timestamp is not None and recorded_at != current_timestamp:
+            portfolio_rows.append((current_timestamp, total))
         balance_int = int(balance)
         previous = latest_by_account.get(account_key, 0)
         total += balance_int - previous
         latest_by_account[account_key] = balance_int
-        current_ts = recorded_at
+        current_timestamp = recorded_at
 
-    if current_ts is not None:
-        portfolio_rows.append((current_ts, total))
+    if current_timestamp is not None:
+        portfolio_rows.append((current_timestamp, total))
     return portfolio_rows
 
 
@@ -698,10 +673,10 @@ def extend_portfolio_rows_to_now(portfolio_rows: list[tuple[dt.datetime, int]]) 
 
 
 def build_daydiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
+    timezone = get_app_timezone()
     day_totals: dict[dt.date, int] = {}
     for recorded_at, balance in portfolio_rows:
-        local_date = recorded_at.astimezone(get_app_timezone()).date()
-        day_totals[local_date] = int(balance)
+        day_totals[recorded_at.astimezone(timezone).date()] = int(balance)
 
     ordered = sorted(day_totals.items())
     result: list[tuple[dt.date, int]] = []
@@ -716,18 +691,18 @@ def build_daydiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tu
 
 
 def build_monthdiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
+    timezone = get_app_timezone()
     month_totals: dict[tuple[int, int], int] = {}
     month_labels: dict[tuple[int, int], dt.date] = {}
     for recorded_at, balance in portfolio_rows:
-        local_stamp = recorded_at.astimezone(get_app_timezone())
+        local_stamp = recorded_at.astimezone(timezone)
         month_key = (local_stamp.year, local_stamp.month)
         month_totals[month_key] = int(balance)
         month_labels[month_key] = local_stamp.date()
 
-    ordered_keys = sorted(month_totals)
     result: list[tuple[dt.date, int]] = []
     previous_total: int | None = None
-    for month_key in ordered_keys:
+    for month_key in sorted(month_totals):
         total = month_totals[month_key]
         if previous_total is None:
             previous_total = total
@@ -779,47 +754,60 @@ def rebuild_portfolio_summaries(cur: Any) -> None:
         )
 
 
-def KB_main() -> bool | tuple[str, Exception]:
+def build_run_context() -> RunContext:
+    if not FILE_KB_PICKLE.is_file():
+        raise FileNotFoundError(f"{FILE_KB_PICKLE} is missing")
+
+    last_update = load_last_update_state()
+    last_update["KB"] = FILE_KB_PICKLE.stat().st_mtime
+    return RunContext(
+        recorded_at=now_local().replace(microsecond=0),
+        last_update=last_update,
+        exclusions=load_exclusion_rules(),
+    )
+
+
+def build_accounts(cur: Any, context: RunContext) -> Accounts:
+    log("=== Load KB openbank data ===")
+    accounts = load_openbank_accounts(context.exclusions)
+
+    log("=== Apply manual inputs ===")
+    apply_manual_inputs_from_db(cur, accounts)
+
+    validate_total(accounts)
+
+    log("=== Apply card balance ===")
+    apply_card_balance(cur, context.last_update, accounts)
+    return accounts
+
+
+def persist_accounts(cur: Any, context: RunContext, accounts: Accounts) -> Accounts:
+    filtered_accounts = filter_accounts(accounts, context.exclusions)
+    if not filtered_accounts:
+        raise RuntimeError("No accounts remained after filtering")
+
+    log("=== Upsert account metadata ===")
+    upsert_accounts(cur, filtered_accounts, is_active=True)
+
+    log("=== Insert account history ===")
+    insert_account_history(cur, filtered_accounts, context.recorded_at)
+    zero_out_missing_accounts(cur, filtered_accounts, context.recorded_at, context.exclusions)
+    return filtered_accounts
+
+
+def run_kb_pipeline() -> bool | tuple[str, Exception]:
     connection = None
+    cur = None
     try:
         log("=== Prepare run context ===")
-        recorded_at = now_local().replace(microsecond=0)
-        last_update = lst_udt(operation="read")
-        exceptions = load_exceptions()
-
-        if not os.path.isfile(FILE_KB_PICKLE):
-            raise FileNotFoundError(f"{FILE_KB_PICKLE} is missing")
-        last_update["KB"] = os.path.getmtime(FILE_KB_PICKLE)
-
-        log("=== Load KB openbank data ===")
-        accounts = load_openbank_accounts(exceptions)
-        load_kb_securities(accounts)
+        context = build_run_context()
 
         connection = get_db_connection()
         cur = connection.cursor()
         ensure_normalized_schema(cur)
 
-        log("=== Apply manual inputs ===")
-        apply_manual_inputs_from_db(cur, accounts)
-
-        log("=== Apply CREON balance ===")
-        apply_creon_balance(accounts)
-
-        validate_total(accounts)
-
-        log("=== Apply card balance ===")
-        apply_card_balance(cur, last_update, accounts)
-
-        filtered_accounts = filter_accounts(accounts, exceptions)
-        if not filtered_accounts:
-            raise RuntimeError("No accounts remained after filtering")
-
-        log("=== Upsert account metadata ===")
-        upsert_accounts(cur, filtered_accounts, is_active=True)
-
-        log("=== Insert account history ===")
-        insert_account_history(cur, filtered_accounts, recorded_at)
-        zero_out_missing_accounts(cur, filtered_accounts, recorded_at, exceptions)
+        accounts = build_accounts(cur, context)
+        filtered_accounts = persist_accounts(cur, context, accounts)
 
         log("=== Rebuild portfolio summaries ===")
         rebuild_portfolio_summaries(cur)
@@ -827,16 +815,13 @@ def KB_main() -> bool | tuple[str, Exception]:
         log("=== Record crawl heartbeat ===")
         write_crawl_heartbeat(
             cur,
-            recorded_at=recorded_at,
+            recorded_at=context.recorded_at,
             account_count=len(filtered_accounts),
         )
 
         connection.commit()
-        cur.close()
-        connection.close()
-        connection = None
 
-        if not lst_udt(operation="save", last_update=last_update):
+        if not save_last_update_state(context.last_update):
             raise RuntimeError(f"Failed to save {FILE_LAST_UPDATE}")
 
         log("=== Complete ===")
@@ -844,8 +829,16 @@ def KB_main() -> bool | tuple[str, Exception]:
     except Exception as exc:
         if connection is not None:
             connection.rollback()
-            connection.close()
         return ("ERROR", exc)
+    finally:
+        if cur is not None:
+            cur.close()
+        if connection is not None:
+            connection.close()
+
+
+def KB_main() -> bool | tuple[str, Exception]:
+    return run_kb_pipeline()
 
 
 if __name__ == "__main__":

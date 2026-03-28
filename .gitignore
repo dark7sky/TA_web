@@ -30,6 +30,7 @@ debug
 !logger.py
 !notify_telegram.py
 !client.py
+!KB_web_playwright.py
 !Focus_window.py
 !keys_qmenu.py
 !normalized_pg.py
