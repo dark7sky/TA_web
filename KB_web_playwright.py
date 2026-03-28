@@ -36,11 +36,6 @@ logs = logger(Path(__file__).stem)
 
 DEFAULT_MAIN_URL = "https://www.kbsec.com"
 DEFAULT_LOGIN_URL = "https://www.kbsec.com/go.able"
-DEFAULT_USER_AGENT = (
-    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/90.0.4430.229 Whale/2.10.123.42 Safari/537.36"
-)
 
 DEFAULT_WAIT_SECONDS = 15
 DEFAULT_WAIT_MS = DEFAULT_WAIT_SECONDS * 1000
@@ -55,7 +50,6 @@ STOP_AFTER_TIME = dt.time(23, 45)
 COOKIE_FILE = Path("cookie_KB.pickle")
 OPENBANK_PICKLE_FILE = Path("KB.pickle")
 WS_CONFIG_FILE = Path("ws.config")
-DEFAULT_USER_DATA_DIR = Path("Chrome")
 
 LOGIN_FRAME_SELECTOR = 'iframe[name="LOGN010001-contentsFrame"]'
 CERTIFICATE_FRAME_SELECTOR = 'iframe[name="yettie_sign_iframe"]'
@@ -69,12 +63,6 @@ def log_message(message: str, *, send: bool = False) -> None:
 
 def login_delay(seconds: float = LOGIN_ACTION_DELAY_SECONDS) -> None:
     time.sleep(seconds)
-
-
-def normalize_user_agent(raw_user_agent: str) -> str:
-    if raw_user_agent.startswith("user-agent="):
-        return raw_user_agent.split("=", 1)[1]
-    return raw_user_agent
 
 
 def normalize_same_site(value: Optional[str]) -> Optional[str]:
@@ -196,10 +184,8 @@ class KBConfig:
     my_token: str
     users_id: str
     vm_qm_id: str
-    chrome_user_data_dir: str
     url_main: str = DEFAULT_MAIN_URL
     url_login: str = DEFAULT_LOGIN_URL
-    user_agent: str = DEFAULT_USER_AGENT
     cookie_file: Path = COOKIE_FILE
     openbank_pickle_file: Path = OPENBANK_PICKLE_FILE
 
@@ -216,10 +202,6 @@ class KBConfig:
             my_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             users_id=os.getenv("TELEGRAM_USER_ID", ""),
             vm_qm_id=os.getenv("VM_QM_ID", "200"),
-            chrome_user_data_dir=os.getenv(
-                "CHROME_USER_DATA_DIR",
-                str(DEFAULT_USER_DATA_DIR.resolve()),
-            ),
         )
         config.validate()
         return config
@@ -257,10 +239,9 @@ class LoginRetryLimitReached(RuntimeError):
 
 @dataclass
 class PlaywrightSession:
-    # user_data_dir: str
     headless: bool
-    # user_agent: str
     playwright: Any = None
+    browser: Any = None
     context: Optional[BrowserContext] = None
     page: Optional[Page] = None
     browser_channel: Optional[str] = None
@@ -280,25 +261,46 @@ class PlaywrightSession:
                 pass
             self.context = None
             self.page = None
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
 
-        common_kwargs = {
-            # "user_data_dir": self.user_data_dir,
+        browser_kwargs = {
             "headless": self.headless,
+        }
+        context_kwargs = {
             "viewport": {"width": 1280, "height": 900},
             "locale": "ko-KR",
-            # "user_agent": normalize_user_agent(self.user_agent),
         }
 
         launch_errors: list[str] = []
         for browser_name, browser_channel in (("chromium", None), ("chrome", "chrome")):
+            browser = None
+            context = None
             try:
-                kwargs = dict(common_kwargs)
+                kwargs = dict(browser_kwargs)
                 if browser_channel is not None:
                     kwargs["channel"] = browser_channel
-                self.context = self.playwright.chromium.launch_persistent_context(**kwargs)
+                browser = self.playwright.chromium.launch(**kwargs)
+                context = browser.new_context(**context_kwargs)
+                self.browser = browser
+                self.context = context
                 self.browser_channel = browser_name
                 break
             except Exception as exc:
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
                 launch_errors.append(f"{browser_name} :: {exc}")
 
         if self.context is None:
@@ -354,6 +356,12 @@ class PlaywrightSession:
             except Exception:
                 pass
             self.context = None
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
         if self.playwright is not None:
             try:
                 self.playwright.stop()
@@ -755,9 +763,9 @@ def main() -> bool:
     log_message("1. Prepare Playwright browser")
     log_message("Playwright headed mode enabled")
 
-    session = PlaywrightSession(headless=False,)
-    # user_agent=config.user_agent,
-    # user_data_dir=config.chrome_user_data_dir,
+    session = PlaywrightSession(
+        headless=False,
+    )
     session.start()
     atexit.register(final_proc, session, config, runtime)
 
