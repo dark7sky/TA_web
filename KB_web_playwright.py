@@ -617,11 +617,11 @@ def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
         cells = row.locator("td")
         if cells.count() < 5:
             continue
-        bank_name = cells.nth(0).inner_text().strip()
-        account_type = cells.nth(1).inner_text().strip()
-        account_number = cells.nth(2).inner_text().strip()
-        account_name = cells.nth(3).inner_text().strip()
-        account_value = cells.nth(4).inner_text().strip()
+        bank_name = cells.nth(1).inner_text().strip()
+        account_type = cells.nth(2).inner_text().strip()
+        account_number = cells.nth(3).inner_text().strip()
+        account_name = cells.nth(4).inner_text().strip()
+        account_value = cells.nth(5).inner_text().strip().replace("원", "")
         if not account_number or not account_value:
             continue
         collected_rows.append(
