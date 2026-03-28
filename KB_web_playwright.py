@@ -480,8 +480,11 @@ def execute_login(config: KBConfig, session: PlaywrightSession) -> bool:
     try:
         page.get_by_role("link", name="로그인").click()
         current_login_frame = login_frame(page)
+        time.sleep(1)
         current_login_frame.get_by_label("자동로그아웃").select_option("28800000")
+        time.sleep(1)
         current_login_frame.get_by_role("checkbox", name="PC방화벽").uncheck()
+        time.sleep(1)
         current_login_frame.get_by_role("button", name="공동인증서로그인").click()
 
         if "TA-WIN" in socket.gethostname():
