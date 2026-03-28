@@ -494,7 +494,7 @@ def perform_local_login(config: KBConfig, page: Page, session: PlaywrightSession
 
 
 def execute_login(config: KBConfig, session: PlaywrightSession) -> bool:
-    page = session.goto(config.url_login, wait_until="load")
+    page = session.current_page()
     try:
         page.get_by_role("link", name="로그인").click()
         current_login_frame = login_frame(page)
@@ -565,13 +565,13 @@ def restore_cookies(session: PlaywrightSession, config: KBConfig, cookies: list[
 
 
 def ensure_logged_in(session: PlaywrightSession, config: KBConfig, runtime: RuntimeState) -> None:
-    session.goto(config.url_main)
+    # session.goto(config.url_main)
     if is_logged_in(session):
         reset_login_loop_count(runtime)
         return
     if not run_login_process(session, config, runtime):
         raise RuntimeError("KB login failed")
-    session.goto(config.url_main)
+    # session.goto(config.url_main)
     if not is_logged_in(session):
         login_error = RuntimeError("KB login failed after relaunch")
         increase_login_loop_count(runtime, login_error)
