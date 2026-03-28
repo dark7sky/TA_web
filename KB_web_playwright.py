@@ -50,6 +50,7 @@ STOP_AFTER_TIME = dt.time(23, 45)
 COOKIE_FILE = Path("cookie_KB.pickle")
 OPENBANK_PICKLE_FILE = Path("KB.pickle")
 WS_CONFIG_FILE = Path("ws.config")
+DEFAULT_USER_DATA_DIR = Path("Chrome")
 
 LOGIN_FRAME_SELECTOR = 'iframe[name="LOGN010001-contentsFrame"]'
 CERTIFICATE_FRAME_SELECTOR = 'iframe[name="yettie_sign_iframe"]'
@@ -184,6 +185,7 @@ class KBConfig:
     my_token: str
     users_id: str
     vm_qm_id: str
+    chrome_user_data_dir: str
     url_main: str = DEFAULT_MAIN_URL
     url_login: str = DEFAULT_LOGIN_URL
     cookie_file: Path = COOKIE_FILE
@@ -202,6 +204,10 @@ class KBConfig:
             my_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             users_id=os.getenv("TELEGRAM_USER_ID", ""),
             vm_qm_id=os.getenv("VM_QM_ID", "200"),
+            chrome_user_data_dir=os.getenv(
+                "CHROME_USER_DATA_DIR",
+                str(DEFAULT_USER_DATA_DIR.resolve()),
+            ),
         )
         config.validate()
         return config
@@ -239,9 +245,9 @@ class LoginRetryLimitReached(RuntimeError):
 
 @dataclass
 class PlaywrightSession:
+    user_data_dir: str
     headless: bool
     playwright: Any = None
-    browser: Any = None
     context: Optional[BrowserContext] = None
     page: Optional[Page] = None
     browser_channel: Optional[str] = None
@@ -261,46 +267,24 @@ class PlaywrightSession:
                 pass
             self.context = None
             self.page = None
-        if self.browser is not None:
-            try:
-                self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
 
-        browser_kwargs = {
+        common_kwargs = {
+            "user_data_dir": self.user_data_dir,
             "headless": self.headless,
-        }
-        context_kwargs = {
             "viewport": {"width": 1280, "height": 900},
             "locale": "ko-KR",
         }
 
         launch_errors: list[str] = []
         for browser_name, browser_channel in (("chromium", None), ("chrome", "chrome")):
-            browser = None
-            context = None
             try:
-                kwargs = dict(browser_kwargs)
+                kwargs = dict(common_kwargs)
                 if browser_channel is not None:
                     kwargs["channel"] = browser_channel
-                browser = self.playwright.chromium.launch(**kwargs)
-                context = browser.new_context(**context_kwargs)
-                self.browser = browser
-                self.context = context
+                self.context = self.playwright.chromium.launch_persistent_context(**kwargs)
                 self.browser_channel = browser_name
                 break
             except Exception as exc:
-                if context is not None:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-                if browser is not None:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
                 launch_errors.append(f"{browser_name} :: {exc}")
 
         if self.context is None:
@@ -356,12 +340,6 @@ class PlaywrightSession:
             except Exception:
                 pass
             self.context = None
-        if self.browser is not None:
-            try:
-                self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
         if self.playwright is not None:
             try:
                 self.playwright.stop()
@@ -609,6 +587,7 @@ def confirm_optional_popup(page: Page, trigger: Callable[[], None]) -> None:
             trigger()
         popup = popup_info.value
         popup.frame_locator("iframe").get_by_role("button", name="확인완료").click()
+        popup.close()
     except Exception:
         pass
 
@@ -628,8 +607,10 @@ def agree_openbank_terms(page: Page) -> None:
 
 
 def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
-    page.get_by_role("table").wait_for(timeout=DEFAULT_WAIT_MS)
+    time.sleep(1)  # Wait for all rows to load
+    page.get_by_role("cell", name="산업은행").wait_for(timeout=DEFAULT_WAIT_MS)
     rows = page.get_by_role("table").locator("tr")
+    print("Total rows found:", rows.count())
     collected_rows: list[list[Any]] = []
     for index in range(rows.count()):
         row = rows.nth(index)
@@ -765,6 +746,7 @@ def main() -> bool:
     log_message("Playwright headed mode enabled")
 
     session = PlaywrightSession(
+        user_data_dir=config.chrome_user_data_dir,
         headless=False,
     )
     session.start()
