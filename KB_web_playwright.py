@@ -44,7 +44,8 @@ DEFAULT_USER_AGENT = (
 
 DEFAULT_WAIT_SECONDS = 15
 DEFAULT_WAIT_MS = DEFAULT_WAIT_SECONDS * 1000
-SHORT_SLEEP_SECONDS = 1
+SHORT_SLEEP_SECONDS = 2
+LOGIN_ACTION_DELAY_SECONDS = 2
 MANUAL_LOGIN_TIMEOUT_SECONDS = 300
 HEARTBEAT_INTERVAL_SECONDS = 120
 MAX_SERVICE_RETRIES = 6
@@ -64,6 +65,10 @@ load_dotenv()
 
 def log_message(message: str, *, send: bool = False) -> None:
     logs.msg(message, send=send)
+
+
+def login_delay(seconds: float = LOGIN_ACTION_DELAY_SECONDS) -> None:
+    time.sleep(seconds)
 
 
 def normalize_user_agent(raw_user_agent: str) -> str:
@@ -252,9 +257,9 @@ class LoginRetryLimitReached(RuntimeError):
 
 @dataclass
 class PlaywrightSession:
-    user_data_dir: str
+    # user_data_dir: str
     headless: bool
-    user_agent: str
+    # user_agent: str
     playwright: Any = None
     context: Optional[BrowserContext] = None
     page: Optional[Page] = None
@@ -277,11 +282,11 @@ class PlaywrightSession:
             self.page = None
 
         common_kwargs = {
-            "user_data_dir": self.user_data_dir,
+            # "user_data_dir": self.user_data_dir,
             "headless": self.headless,
             "viewport": {"width": 1280, "height": 900},
             "locale": "ko-KR",
-            "user_agent": normalize_user_agent(self.user_agent),
+            # "user_agent": normalize_user_agent(self.user_agent),
         }
 
         launch_errors: list[str] = []
@@ -447,9 +452,9 @@ def is_logged_in(session: PlaywrightSession) -> bool:
 def wait_for_login(session: PlaywrightSession, timeout_seconds: int) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        login_delay(SHORT_SLEEP_SECONDS)
         if is_logged_in(session):
             return True
-        time.sleep(SHORT_SLEEP_SECONDS)
     return False
 
 
@@ -468,7 +473,7 @@ def submit_vm_certificate_password(config: KBConfig) -> None:
             cli.exec_command(
                 f"sudo qm sendkey {config.vm_qm_id} {keys_qmenu.to_qmenu(key_value)}"
             )
-            time.sleep(1)
+            login_delay()
         cli.exec_command(f"sudo qm sendkey {config.vm_qm_id} ret")
     finally:
         cli.close()
@@ -476,7 +481,7 @@ def submit_vm_certificate_password(config: KBConfig) -> None:
 
 def perform_vm_login(config: KBConfig, page: Page) -> None:
     Focus_window.focus("KB증권")
-    time.sleep(1)
+    login_delay()
     try:
         certificate_frame(page).locator("#passwordInput").click()
     except Exception:
@@ -487,7 +492,9 @@ def perform_vm_login(config: KBConfig, page: Page) -> None:
 
 def perform_local_login(config: KBConfig, page: Page, session: PlaywrightSession) -> bool:
     password_input = certificate_frame(page).locator("#passwordInput")
+    login_delay()
     password_input.fill(config.kb_cpswd, timeout=10000)
+    login_delay()
     password_input.press("Enter")
     log_message("Wait until login done")
     return wait_for_login(session, MANUAL_LOGIN_TIMEOUT_SECONDS)
@@ -498,11 +505,11 @@ def execute_login(config: KBConfig, session: PlaywrightSession) -> bool:
     try:
         page.get_by_role("link", name="로그인").click()
         current_login_frame = login_frame(page)
-        time.sleep(1)
+        login_delay()
         current_login_frame.get_by_label("자동로그아웃").select_option("28800000")
-        time.sleep(1)
+        login_delay()
         current_login_frame.get_by_role("checkbox", name="PC방화벽").uncheck()
-        time.sleep(1)
+        login_delay()
         current_login_frame.get_by_role("button", name="공동인증서로그인").click()
 
         if "TA-WIN" in socket.gethostname():
@@ -748,11 +755,9 @@ def main() -> bool:
     log_message("1. Prepare Playwright browser")
     log_message("Playwright headed mode enabled")
 
-    session = PlaywrightSession(
-        user_data_dir=config.chrome_user_data_dir,
-        headless=False,
-        user_agent=config.user_agent,
-    )
+    session = PlaywrightSession(headless=False,)
+    # user_agent=config.user_agent,
+    # user_data_dir=config.chrome_user_data_dir,
     session.start()
     atexit.register(final_proc, session, config, runtime)
 
