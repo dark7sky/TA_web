@@ -44,7 +44,6 @@ USE_TQDM = True
 
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
-    "toss",
     "debt",
     "insurance",
     "lab_private",
@@ -55,7 +54,6 @@ KNOWN_SPECIAL_KEYS = {
 
 MANUAL_KEY_ALIASES = {
     "랩비": "lab_private",
-    "toss증권": "toss",
     "대출": "debt",
     "보험": "insurance",
 }

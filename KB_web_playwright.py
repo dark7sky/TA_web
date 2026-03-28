@@ -636,13 +636,64 @@ def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
     return collected_rows
 
 
+def open_my_asset_page(page: Page) -> None:
+    page.get_by_role("link", name="My자산").click()
+    page.get_by_role("link", name="더보기").click()
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+def scrape_kb_securities_accounts(page: Page) -> list[list[Any]]:
+    collected_rows: list[list[Any]] = []
+
+    row_index = 0
+    while True:
+        try:
+            collected_rows.append(
+                [
+                    "KB증권",
+                    "CMA",
+                    page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_0").inner_text().strip(),
+                    "CMA",
+                    string_to_int(
+                        page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_3").inner_text().strip()
+                    ),
+                ]
+            )
+        except Exception:
+            break
+        row_index += 1
+
+    row_index = 0
+    while True:
+        try:
+            collected_rows.append(
+                [
+                    "KB증권",
+                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_2").inner_text().strip(),
+                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_0").inner_text().strip(),
+                    "종합위탁",
+                    string_to_int(
+                        page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_3").inner_text().strip()
+                    ),
+                ]
+            )
+        except Exception:
+            break
+        row_index += 1
+
+    return collected_rows
+
+
 def save_collection_results(
     session: PlaywrightSession,
     config: KBConfig,
     collected_rows: list[list[Any]],
 ) -> None:
     save_pickle(config.openbank_pickle_file, collected_rows)
-    log_message(f"Saving results - OpenBank={len(collected_rows)}")
+    log_message(f"Saving results - Accounts={len(collected_rows)}")
     if not session.save_cookies(config.cookie_file, config.url_main):
         raise RuntimeError("cookie save failed")
 
@@ -685,9 +736,21 @@ def run_collection_cycle(session: PlaywrightSession, config: KBConfig, runtime: 
             lambda: agree_openbank_terms(page),
         )
         collected_rows = run_stage(
-            "6. Data scraping",
+            "6. Data scraping - Openbank",
             runtime,
             lambda: scrape_openbank_accounts(page),
+        )
+        run_stage(
+            "6.1. My asset page",
+            runtime,
+            lambda: open_my_asset_page(page),
+        )
+        collected_rows.extend(
+            run_stage(
+                "6.2. Data scraping - KB securities",
+                runtime,
+                lambda: scrape_kb_securities_accounts(page),
+            )
         )
         run_stage(
             "7. Saving results",
