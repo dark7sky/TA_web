@@ -655,7 +655,7 @@ def scrape_kb_securities_accounts(page: Page) -> list[list[Any]]:
                 [
                     "KB증권",
                     "CMA",
-                    page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_0").inner_text().strip(),
+                    page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_0").inner_text().strip().replace("-", ""),
                     "CMA",
                     string_to_int(
                         page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_3").inner_text().strip()
@@ -673,7 +673,7 @@ def scrape_kb_securities_accounts(page: Page) -> list[list[Any]]:
                 [
                     "KB증권",
                     page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_2").inner_text().strip(),
-                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_0").inner_text().strip(),
+                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_0").inner_text().strip().replace("-", ""),
                     "종합위탁",
                     string_to_int(
                         page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_3").inner_text().strip()
