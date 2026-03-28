@@ -476,8 +476,9 @@ def submit_vm_certificate_password(config: KBConfig) -> None:
         password=config.vm_pswd,
     )
     try:
-        time.sleep(5)
+        time.sleep(1)
         for key_value in config.kb_cpswd:
+            print(f"Sending key: {key_value}")
             cli.exec_command(
                 f"sudo qm sendkey {config.vm_qm_id} {keys_qmenu.to_qmenu(key_value)}"
             )
