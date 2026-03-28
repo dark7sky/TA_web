@@ -480,10 +480,10 @@ def submit_vm_certificate_password(config: KBConfig) -> None:
         for key_value in config.kb_cpswd:
             print(f"Sending key: {key_value}")
             cli.exec_command(
-                f"sudo qm sendkey {config.vm_qm_id} {keys_qmenu.to_qmenu(key_value)}"
+                f"qm sendkey {config.vm_qm_id} {keys_qmenu.to_qmenu(key_value)}"
             )
             login_delay()
-        cli.exec_command(f"sudo qm sendkey {config.vm_qm_id} ret")
+        cli.exec_command(f"qm sendkey {config.vm_qm_id} ret")
     finally:
         cli.close()
 
