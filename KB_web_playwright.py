@@ -276,7 +276,6 @@ class PlaywrightSession:
             self.context = None
             self.page = None
 
-        launch_errors: list[str] = []
         common_kwargs = {
             "user_data_dir": self.user_data_dir,
             "headless": self.headless,
@@ -285,19 +284,11 @@ class PlaywrightSession:
             "user_agent": normalize_user_agent(self.user_agent),
         }
 
-        for browser_channel in ("chrome", None):
-            try:
-                kwargs = dict(common_kwargs)
-                if browser_channel is not None:
-                    kwargs["channel"] = browser_channel
-                self.context = self.playwright.chromium.launch_persistent_context(**kwargs)
-                self.browser_channel = browser_channel
-                break
-            except Exception as exc:
-                launch_errors.append(f"channel={browser_channel or 'default'} :: {exc}")
-
-        if self.context is None:
-            raise RuntimeError("Unable to launch Playwright browser: " + " | ".join(launch_errors))
+        try:
+            self.context = self.playwright.chromium.launch_persistent_context(**common_kwargs)
+            self.browser_channel = "chromium"
+        except Exception as exc:
+            raise RuntimeError(f"Unable to launch Playwright Chromium browser :: {exc}") from exc
 
         self.context.set_default_timeout(DEFAULT_WAIT_MS)
         self.context.set_default_navigation_timeout(DEFAULT_WAIT_MS)
