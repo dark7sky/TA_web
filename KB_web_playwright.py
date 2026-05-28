@@ -608,7 +608,7 @@ def agree_openbank_terms(page: Page) -> None:
 
 def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
     time.sleep(1)  # Wait for all rows to load
-    page.get_by_role("cell", name="산업은행").wait_for(timeout=DEFAULT_WAIT_MS)
+    page.get_by_role("cell", name="신한은행").wait_for(timeout=DEFAULT_WAIT_MS)
     rows = page.get_by_role("table").locator("tr")
     print("Total rows found:", rows.count())
     collected_rows: list[list[Any]] = []
