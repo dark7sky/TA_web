@@ -633,6 +633,7 @@ def chunked(rows: list[tuple[Any, ...]], size: int = 2000) -> list[list[tuple[An
 
 
 def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
+    log("Portfolio summaries: fetching account history")
     cur.execute(
         """
         SELECT account_key, recorded_at, balance
@@ -640,12 +641,15 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
         ORDER BY recorded_at, account_key
         """
     )
+    history_rows = cur.fetchall()
+    log(f"Portfolio summaries: fetched {len(history_rows):,} history rows")
+
     latest_by_account: dict[str, int] = {}
     total = 0
     current_timestamp: dt.datetime | None = None
     portfolio_rows: list[tuple[dt.datetime, int]] = []
 
-    for account_key, recorded_at, balance in progress_iter(cur.fetchall(), desc="portfolio_totals"):
+    for account_key, recorded_at, balance in history_rows:
         if current_timestamp is not None and recorded_at != current_timestamp:
             portfolio_rows.append((current_timestamp, total))
         balance_int = int(balance)
@@ -656,6 +660,7 @@ def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
 
     if current_timestamp is not None:
         portfolio_rows.append((current_timestamp, total))
+    log(f"Portfolio summaries: computed {len(portfolio_rows):,} portfolio rows")
     return portfolio_rows
 
 
@@ -716,7 +721,15 @@ def rebuild_portfolio_summaries(cur: Any) -> None:
     daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
     monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
 
-    cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
+    log(
+        "Portfolio summaries: replacing "
+        f"{len(portfolio_rows):,} portfolio, {len(daydiff_rows):,} daily, "
+        f"and {len(monthdiff_rows):,} monthly rows"
+    )
+    # These tables are small enough that DELETE avoids TRUNCATE's ACCESS EXCLUSIVE lock.
+    cur.execute("DELETE FROM portfolio_balance_history")
+    cur.execute("DELETE FROM portfolio_daydiff")
+    cur.execute("DELETE FROM portfolio_monthdiff")
 
     for chunk in chunked(portfolio_rows):
         psycopg2.extras.execute_values(
@@ -750,6 +763,8 @@ def rebuild_portfolio_summaries(cur: Any) -> None:
             """,
             chunk,
         )
+
+    log("Portfolio summaries: replacement complete")
 
 
 def build_run_context() -> RunContext:
