@@ -11,10 +11,10 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import cards
+import normalized_pg
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from tqdm import tqdm
 
 import logger
 
@@ -40,7 +40,8 @@ APP_TIMEZONE_ENV = "APP_TIMEZONE"
 EXCEPTION_BANKS_ENV = "EXCEPTION_BANKS"
 EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
 TA_WEB_LAST_CRAWLED_AT_KEY = "ta_web_last_crawled_at"
-USE_TQDM = True
+MIN_COLLECTION_RATIO_ENV = "MIN_ACCOUNT_COLLECTION_RATIO"
+DEFAULT_MIN_COLLECTION_RATIO = 0.8
 
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
@@ -88,10 +89,6 @@ class RunContext:
 
 
 Accounts = dict[str, AccountSnapshot]
-
-
-def progress_iter(iterable: Any, desc: str = "") -> Any:
-    return tqdm(iterable, desc=desc) if USE_TQDM else iterable
 
 
 def required_env(key: str) -> str:
@@ -184,74 +181,11 @@ def parse_int_value(raw_value: Any) -> int | None:
 
 
 def get_db_connection() -> Any:
-    return psycopg2.connect(
-        host=required_env("DB_HOST"),
-        database=required_env("DB_NAME"),
-        user=required_env("DB_USER"),
-        password=required_env("DB_PASSWORD"),
-        port=os.getenv("DB_PORT", "5432"),
-        sslmode="disable",
-    )
+    return normalized_pg.get_db_connection()
 
 
 def ensure_normalized_schema(cur: Any) -> None:
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_key TEXT PRIMARY KEY,
-            company TEXT,
-            type TEXT,
-            name TEXT,
-            memo TEXT NOT NULL DEFAULT '',
-            is_special BOOLEAN NOT NULL DEFAULT FALSE,
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS account_balance_history (
-            account_key TEXT NOT NULL REFERENCES accounts(account_key) ON DELETE CASCADE,
-            recorded_at TIMESTAMPTZ NOT NULL,
-            balance BIGINT NOT NULL,
-            source TEXT NOT NULL,
-            PRIMARY KEY (account_key, recorded_at)
-        )
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {SYSTEM_SETTINGS_TABLE} (
-            id SERIAL PRIMARY KEY,
-            setting_key VARCHAR(100) UNIQUE NOT NULL,
-            setting_value JSON NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS portfolio_balance_history (
-            recorded_at TIMESTAMPTZ PRIMARY KEY,
-            balance BIGINT NOT NULL
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS portfolio_daydiff (
-            balance_date DATE PRIMARY KEY,
-            balance BIGINT NOT NULL
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS portfolio_monthdiff (
-            balance_date DATE PRIMARY KEY,
-            balance BIGINT NOT NULL
-        )
-        """,
-        'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_account_recorded_at" ON "account_balance_history" ("account_key", "recorded_at" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_recorded_at" ON "account_balance_history" ("recorded_at" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_balance_history_recorded_at" ON "portfolio_balance_history" ("recorded_at" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_daydiff_balance_date" ON "portfolio_daydiff" ("balance_date" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_monthdiff_balance_date" ON "portfolio_monthdiff" ("balance_date" DESC)',
-    ]
-    for statement in statements:
-        cur.execute(statement)
+    normalized_pg.ensure_normalized_schema(cur)
 
 
 def upsert_system_setting(cur: Any, setting_key: str, setting_value: Any) -> None:
@@ -364,13 +298,13 @@ def load_openbank_accounts(exclusions: ExclusionRules) -> Accounts:
 
 
 def apply_manual_inputs_from_db(cur: Any, accounts: Accounts) -> None:
-    try:
-        cur.execute(
-            f'SELECT key_name, value FROM "{MANUAL_INPUTS_TABLE}" ORDER BY key_name'
-        )
-    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable) as exc:
-        log(f"{MANUAL_INPUTS_TABLE} is not ready: {exc}")
+    cur.execute("SELECT to_regclass(%s)", (MANUAL_INPUTS_TABLE,))
+    if cur.fetchone()[0] is None:
+        log(f"{MANUAL_INPUTS_TABLE} is not ready; skipping manual inputs")
         return
+    cur.execute(
+        f'SELECT key_name, value FROM "{MANUAL_INPUTS_TABLE}" ORDER BY key_name'
+    )
 
     for raw_key, raw_value in cur.fetchall():
         if raw_key is None:
@@ -406,23 +340,20 @@ def should_refresh_cards(last_update: dict[str, float]) -> bool:
     return FILE_CARD_EXCEL.stat().st_mtime != last_update["cards"]
 
 
-def fetch_latest_card_balance(cur: Any) -> int:
-    try:
-        cur.execute(
-            """
-            SELECT balance
-            FROM account_balance_history
-            WHERE account_key = 'accounts_cards'
-            ORDER BY recorded_at DESC
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-        if row is None or row[0] is None:
-            return 0
-        return int(row[0])
-    except Exception:
-        return 0
+def fetch_latest_card_balance(cur: Any) -> int | None:
+    cur.execute(
+        """
+        SELECT balance
+        FROM account_balance_history
+        WHERE account_key = 'accounts_cards'
+        ORDER BY recorded_at DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def sync_card_excel() -> None:
@@ -448,6 +379,13 @@ def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accoun
         log("Using latest stored card balance")
 
     card_balance = fetch_latest_card_balance(cur)
+    if card_balance is None:
+        if refresh_cards:
+            raise RuntimeError("Card refresh completed without any stored card balance")
+        log("No stored card balance found; skipping card account merge")
+        return refresh_cards
+
+    log(f"Card balance loaded: {card_balance:,}")
     merge_snapshot(
         accounts,
         build_special_snapshot(
@@ -472,6 +410,56 @@ def filter_accounts(accounts: Accounts, exclusions: ExclusionRules) -> Accounts:
         for key, snapshot in accounts.items()
         if not exclusions.excludes(key, snapshot.company)
     }
+
+
+def get_min_collection_ratio() -> float:
+    raw_value = os.getenv(MIN_COLLECTION_RATIO_ENV, str(DEFAULT_MIN_COLLECTION_RATIO))
+    try:
+        ratio = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{MIN_COLLECTION_RATIO_ENV} must be numeric") from exc
+    if not 0 < ratio <= 1:
+        raise ValueError(f"{MIN_COLLECTION_RATIO_ENV} must be greater than 0 and at most 1")
+    return ratio
+
+
+def validate_collection_completeness(
+    cur: Any,
+    accounts: Accounts,
+    exclusions: ExclusionRules,
+) -> None:
+    cur.execute(
+        """
+        SELECT account_key, COALESCE(company, '')
+        FROM accounts
+        WHERE is_active = TRUE AND is_special = FALSE
+        """
+    )
+    expected_keys = {
+        account_key
+        for account_key, company in cur.fetchall()
+        if not exclusions.excludes(account_key, company)
+    }
+    if not expected_keys:
+        return
+
+    collected_keys = {
+        account_key
+        for account_key, snapshot in accounts.items()
+        if not snapshot.is_special and not exclusions.excludes(account_key, snapshot.company)
+    }
+    matched_count = len(expected_keys & collected_keys)
+    ratio = matched_count / len(expected_keys)
+    minimum_ratio = get_min_collection_ratio()
+    log(
+        "Collection coverage: "
+        f"{matched_count}/{len(expected_keys)} active accounts ({ratio:.1%})"
+    )
+    if ratio < minimum_ratio:
+        raise RuntimeError(
+            "Account collection coverage dropped below the safety threshold: "
+            f"{ratio:.1%} < {minimum_ratio:.1%}"
+        )
 
 
 def build_account_rows(accounts: Accounts, is_active: bool) -> list[tuple[Any, ...]]:
@@ -547,15 +535,15 @@ def build_history_rows(
     return rows
 
 
-def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> None:
+def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetime) -> int:
     if not accounts:
-        return
+        return 0
 
     latest_balances = fetch_latest_balances(cur, list(accounts))
     rows = build_history_rows(accounts, latest_balances, recorded_at)
     if not rows:
         log("No account balance changes detected; skipped history insert.")
-        return
+        return 0
 
     psycopg2.extras.execute_values(
         cur,
@@ -569,6 +557,7 @@ def insert_account_history(cur: Any, accounts: Accounts, recorded_at: dt.datetim
         """,
         rows,
     )
+    return len(rows)
 
 
 def zero_out_missing_accounts(
@@ -576,7 +565,7 @@ def zero_out_missing_accounts(
     current_accounts: Accounts,
     recorded_at: dt.datetime,
     exclusions: ExclusionRules,
-) -> None:
+) -> int:
     cur.execute(
         """
         SELECT
@@ -626,145 +615,31 @@ def zero_out_missing_accounts(
             "UPDATE accounts SET is_active = FALSE, updated_at = now() WHERE account_key = ANY(%s)",
             (zeroed_accounts,),
         )
+    return len(rows_to_insert)
 
 
 def chunked(rows: list[tuple[Any, ...]], size: int = 2000) -> list[list[tuple[Any, ...]]]:
-    return [rows[index : index + size] for index in range(0, len(rows), size)]
+    return [list(chunk) for chunk in normalized_pg.chunked(rows, size)]
 
 
 def compute_portfolio_rows(cur: Any) -> list[tuple[dt.datetime, int]]:
-    log("Portfolio summaries: fetching account history")
-    cur.execute(
-        """
-        SELECT account_key, recorded_at, balance
-        FROM account_balance_history
-        ORDER BY recorded_at, account_key
-        """
-    )
-    history_rows = cur.fetchall()
-    log(f"Portfolio summaries: fetched {len(history_rows):,} history rows")
-
-    latest_by_account: dict[str, int] = {}
-    total = 0
-    current_timestamp: dt.datetime | None = None
-    portfolio_rows: list[tuple[dt.datetime, int]] = []
-
-    for account_key, recorded_at, balance in history_rows:
-        if current_timestamp is not None and recorded_at != current_timestamp:
-            portfolio_rows.append((current_timestamp, total))
-        balance_int = int(balance)
-        previous = latest_by_account.get(account_key, 0)
-        total += balance_int - previous
-        latest_by_account[account_key] = balance_int
-        current_timestamp = recorded_at
-
-    if current_timestamp is not None:
-        portfolio_rows.append((current_timestamp, total))
-    log(f"Portfolio summaries: computed {len(portfolio_rows):,} portfolio rows")
-    return portfolio_rows
+    return normalized_pg.compute_portfolio_rows(cur)
 
 
 def extend_portfolio_rows_to_now(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.datetime, int]]:
-    if not portfolio_rows:
-        return portfolio_rows
-
-    as_of = now_local().replace(microsecond=0)
-    latest_recorded_at, latest_total = portfolio_rows[-1]
-    if latest_recorded_at >= as_of:
-        return portfolio_rows
-    return [*portfolio_rows, (as_of, latest_total)]
+    return normalized_pg.extend_portfolio_rows_to_now(portfolio_rows)
 
 
 def build_daydiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
-    timezone = get_app_timezone()
-    day_totals: dict[dt.date, int] = {}
-    for recorded_at, balance in portfolio_rows:
-        day_totals[recorded_at.astimezone(timezone).date()] = int(balance)
-
-    ordered = sorted(day_totals.items())
-    result: list[tuple[dt.date, int]] = []
-    previous_total: int | None = None
-    for balance_date, total in ordered:
-        if previous_total is None:
-            previous_total = total
-            continue
-        result.append((balance_date, total - previous_total))
-        previous_total = total
-    return result
+    return normalized_pg.build_daydiff_rows(portfolio_rows)
 
 
 def build_monthdiff_rows(portfolio_rows: list[tuple[dt.datetime, int]]) -> list[tuple[dt.date, int]]:
-    timezone = get_app_timezone()
-    month_totals: dict[tuple[int, int], int] = {}
-    month_labels: dict[tuple[int, int], dt.date] = {}
-    for recorded_at, balance in portfolio_rows:
-        local_stamp = recorded_at.astimezone(timezone)
-        month_key = (local_stamp.year, local_stamp.month)
-        month_totals[month_key] = int(balance)
-        month_labels[month_key] = local_stamp.date()
-
-    result: list[tuple[dt.date, int]] = []
-    previous_total: int | None = None
-    for month_key in sorted(month_totals):
-        total = month_totals[month_key]
-        if previous_total is None:
-            previous_total = total
-            continue
-        result.append((month_labels[month_key], total - previous_total))
-        previous_total = total
-    return result
+    return normalized_pg.build_monthdiff_rows(portfolio_rows)
 
 
 def rebuild_portfolio_summaries(cur: Any) -> None:
-    portfolio_rows = compute_portfolio_rows(cur)
-    portfolio_rows_for_periods = extend_portfolio_rows_to_now(portfolio_rows)
-    daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
-    monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
-
-    log(
-        "Portfolio summaries: replacing "
-        f"{len(portfolio_rows):,} portfolio, {len(daydiff_rows):,} daily, "
-        f"and {len(monthdiff_rows):,} monthly rows"
-    )
-    # These tables are small enough that DELETE avoids TRUNCATE's ACCESS EXCLUSIVE lock.
-    cur.execute("DELETE FROM portfolio_balance_history")
-    cur.execute("DELETE FROM portfolio_daydiff")
-    cur.execute("DELETE FROM portfolio_monthdiff")
-
-    for chunk in chunked(portfolio_rows):
-        psycopg2.extras.execute_values(
-            cur,
-            """
-            INSERT INTO portfolio_balance_history (recorded_at, balance)
-            VALUES %s
-            ON CONFLICT (recorded_at) DO UPDATE SET balance = EXCLUDED.balance
-            """,
-            chunk,
-        )
-
-    for chunk in chunked(daydiff_rows):
-        psycopg2.extras.execute_values(
-            cur,
-            """
-            INSERT INTO portfolio_daydiff (balance_date, balance)
-            VALUES %s
-            ON CONFLICT (balance_date) DO UPDATE SET balance = EXCLUDED.balance
-            """,
-            chunk,
-        )
-
-    for chunk in chunked(monthdiff_rows):
-        psycopg2.extras.execute_values(
-            cur,
-            """
-            INSERT INTO portfolio_monthdiff (balance_date, balance)
-            VALUES %s
-            ON CONFLICT (balance_date) DO UPDATE SET balance = EXCLUDED.balance
-            """,
-            chunk,
-        )
-
-    log("Portfolio summaries: replacement complete")
+    normalized_pg.rebuild_portfolio_summaries(cur)
 
 
 def build_run_context() -> RunContext:
@@ -780,10 +655,7 @@ def build_run_context() -> RunContext:
     )
 
 
-def build_accounts(cur: Any, context: RunContext) -> Accounts:
-    log("=== Load KB openbank data ===")
-    accounts = load_openbank_accounts(context.exclusions)
-
+def enrich_accounts_from_db(cur: Any, context: RunContext, accounts: Accounts) -> Accounts:
     log("=== Apply manual inputs ===")
     apply_manual_inputs_from_db(cur, accounts)
 
@@ -794,7 +666,7 @@ def build_accounts(cur: Any, context: RunContext) -> Accounts:
     return accounts
 
 
-def persist_accounts(cur: Any, context: RunContext, accounts: Accounts) -> Accounts:
+def persist_accounts(cur: Any, context: RunContext, accounts: Accounts) -> tuple[Accounts, int]:
     filtered_accounts = filter_accounts(accounts, context.exclusions)
     if not filtered_accounts:
         raise RuntimeError("No accounts remained after filtering")
@@ -803,9 +675,14 @@ def persist_accounts(cur: Any, context: RunContext, accounts: Accounts) -> Accou
     upsert_accounts(cur, filtered_accounts, is_active=True)
 
     log("=== Insert account history ===")
-    insert_account_history(cur, filtered_accounts, context.recorded_at)
-    zero_out_missing_accounts(cur, filtered_accounts, context.recorded_at, context.exclusions)
-    return filtered_accounts
+    inserted_count = insert_account_history(cur, filtered_accounts, context.recorded_at)
+    zeroed_count = zero_out_missing_accounts(
+        cur,
+        filtered_accounts,
+        context.recorded_at,
+        context.exclusions,
+    )
+    return filtered_accounts, inserted_count + zeroed_count
 
 
 def run_kb_pipeline() -> bool | tuple[str, Exception]:
@@ -814,16 +691,24 @@ def run_kb_pipeline() -> bool | tuple[str, Exception]:
     try:
         log("=== Prepare run context ===")
         context = build_run_context()
+        log("=== Load KB openbank data ===")
+        accounts = load_openbank_accounts(context.exclusions)
 
         connection = get_db_connection()
         cur = connection.cursor()
         ensure_normalized_schema(cur)
+        connection.commit()
 
-        accounts = build_accounts(cur, context)
-        filtered_accounts = persist_accounts(cur, context, accounts)
+        accounts = enrich_accounts_from_db(cur, context, accounts)
+        validate_collection_completeness(cur, accounts, context.exclusions)
+        filtered_accounts, changed_count = persist_accounts(cur, context, accounts)
 
-        log("=== Rebuild portfolio summaries ===")
-        rebuild_portfolio_summaries(cur)
+        if changed_count:
+            log(f"=== Update portfolio summaries ({changed_count} history changes) ===")
+            summary_mode = normalized_pg.update_portfolio_summaries(cur, context.recorded_at)
+            log(f"Portfolio summaries: {summary_mode}")
+        else:
+            log("=== Skip portfolio summaries; no history changes ===")
 
         log("=== Record crawl heartbeat ===")
         write_crawl_heartbeat(

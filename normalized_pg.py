@@ -15,6 +15,10 @@ load_dotenv()
 
 APP_TIMEZONE_ENV = "APP_TIMEZONE"
 DEFAULT_TIMEZONE = "Asia/Seoul"
+DB_CONNECT_TIMEOUT_SECONDS = 5
+DB_STATEMENT_TIMEOUT_MS = 60_000
+DB_LOCK_TIMEOUT_MS = 10_000
+SYSTEM_SETTINGS_TABLE = "system_settings"
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
     "toss",
@@ -77,8 +81,16 @@ def append_as_of_balance_row(rows: list[tuple[dt.datetime, int]]) -> list[tuple[
 
 def get_db_connection() -> Any:
     database_url = os.getenv("DATABASE_URL")
+    connection_kwargs = {
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", DB_CONNECT_TIMEOUT_SECONDS)),
+        "application_name": os.getenv("DB_APPLICATION_NAME", "total-account-tracker"),
+        "options": (
+            f"-c statement_timeout={int(os.getenv('DB_STATEMENT_TIMEOUT_MS', DB_STATEMENT_TIMEOUT_MS))} "
+            f"-c lock_timeout={int(os.getenv('DB_LOCK_TIMEOUT_MS', DB_LOCK_TIMEOUT_MS))}"
+        ),
+    }
     if database_url:
-        return psycopg2.connect(database_url)
+        return psycopg2.connect(database_url, **connection_kwargs)
     return psycopg2.connect(
         host=required_env("DB_HOST"),
         database=required_env("DB_NAME"),
@@ -86,6 +98,7 @@ def get_db_connection() -> Any:
         password=required_env("DB_PASSWORD"),
         port=os.getenv("DB_PORT", "5432"),
         sslmode=os.getenv("DB_SSLMODE", "disable"),
+        **connection_kwargs,
     )
 
 
@@ -160,11 +173,19 @@ def ensure_normalized_schema(cur: Any) -> None:
             balance BIGINT NOT NULL
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {SYSTEM_SETTINGS_TABLE} (
+            id SERIAL PRIMARY KEY,
+            setting_key VARCHAR(100) UNIQUE NOT NULL,
+            setting_value JSON NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
         'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_account_recorded_at" ON "account_balance_history" ("account_key", "recorded_at" DESC)',
         'CREATE INDEX IF NOT EXISTS "idx_account_balance_history_recorded_at" ON "account_balance_history" ("recorded_at" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_balance_history_recorded_at" ON "portfolio_balance_history" ("recorded_at" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_daydiff_balance_date" ON "portfolio_daydiff" ("balance_date" DESC)',
-        'CREATE INDEX IF NOT EXISTS "idx_portfolio_monthdiff_balance_date" ON "portfolio_monthdiff" ("balance_date" DESC)',
+        'DROP INDEX IF EXISTS "idx_portfolio_balance_history_recorded_at"',
+        'DROP INDEX IF EXISTS "idx_portfolio_daydiff_balance_date"',
+        'DROP INDEX IF EXISTS "idx_portfolio_monthdiff_balance_date"',
     ]
     for statement in statements:
         cur.execute(statement)
@@ -280,7 +301,9 @@ def rebuild_portfolio_summaries(cur: Any) -> None:
     daydiff_rows = build_daydiff_rows(portfolio_rows_for_periods)
     monthdiff_rows = build_monthdiff_rows(portfolio_rows_for_periods)
 
-    cur.execute("TRUNCATE TABLE portfolio_balance_history, portfolio_daydiff, portfolio_monthdiff")
+    cur.execute("DELETE FROM portfolio_balance_history")
+    cur.execute("DELETE FROM portfolio_daydiff")
+    cur.execute("DELETE FROM portfolio_monthdiff")
 
     for chunk in chunked(portfolio_rows):
         psycopg2.extras.execute_values(
@@ -314,6 +337,75 @@ def rebuild_portfolio_summaries(cur: Any) -> None:
             """,
             chunk,
         )
+
+
+def fetch_current_portfolio_total(cur: Any) -> int:
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(balance), 0)
+        FROM (
+            SELECT DISTINCT ON (account_key) account_key, balance
+            FROM account_balance_history
+            ORDER BY account_key, recorded_at DESC
+        ) latest
+        """
+    )
+    return int(cur.fetchone()[0] or 0)
+
+
+def update_portfolio_summaries(cur: Any, recorded_at: dt.datetime) -> str:
+    cur.execute("SELECT EXISTS (SELECT 1 FROM portfolio_balance_history LIMIT 1)")
+    if not bool(cur.fetchone()[0]):
+        rebuild_portfolio_summaries(cur)
+        return "rebuilt"
+
+    total = fetch_current_portfolio_total(cur)
+    cur.execute(
+        """
+        INSERT INTO portfolio_balance_history (recorded_at, balance)
+        VALUES (%s, %s)
+        ON CONFLICT (recorded_at) DO UPDATE SET balance = EXCLUDED.balance
+        """,
+        (recorded_at, total),
+    )
+
+    cur.execute("SELECT recorded_at, balance FROM portfolio_balance_history ORDER BY recorded_at")
+    portfolio_rows = [(row[0], int(row[1])) for row in cur.fetchall()]
+    period_rows = extend_portfolio_rows_to_now(portfolio_rows)
+    daydiff_rows = build_daydiff_rows(period_rows)
+    monthdiff_rows = build_monthdiff_rows(period_rows)
+
+    local_stamp = recorded_at.astimezone(get_app_timezone())
+    affected_date = local_stamp.date()
+    month_start = affected_date.replace(day=1)
+    if affected_date.month == 12:
+        next_month = affected_date.replace(year=affected_date.year + 1, month=1, day=1)
+    else:
+        next_month = affected_date.replace(month=affected_date.month + 1, day=1)
+
+    cur.execute("DELETE FROM portfolio_daydiff WHERE balance_date = %s", (affected_date,))
+    current_day_rows = [row for row in daydiff_rows if row[0] == affected_date]
+    if current_day_rows:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO portfolio_daydiff (balance_date, balance) VALUES %s",
+            current_day_rows,
+        )
+
+    cur.execute(
+        "DELETE FROM portfolio_monthdiff WHERE balance_date >= %s AND balance_date < %s",
+        (month_start, next_month),
+    )
+    current_month_rows = [
+        row for row in monthdiff_rows if month_start <= row[0] < next_month
+    ]
+    if current_month_rows:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO portfolio_monthdiff (balance_date, balance) VALUES %s",
+            current_month_rows,
+        )
+    return "updated"
 
 
 def upsert_accounts(cur: Any, rows: Sequence[tuple[Any, ...]]) -> None:

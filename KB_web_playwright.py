@@ -38,7 +38,11 @@ DEFAULT_MAIN_URL = "https://www.kbsec.com"
 DEFAULT_LOGIN_URL = "https://www.kbsec.com/go.able"
 
 DEFAULT_WAIT_SECONDS = 30
-DEFAULT_WAIT_MS = DEFAULT_WAIT_SECONDS * 5000
+DEFAULT_WAIT_MS = DEFAULT_WAIT_SECONDS * 1000
+DEFAULT_PIPELINE_TIMEOUT_SECONDS = 300
+DEFAULT_MIN_SCRAPE_RATIO = 0.8
+ASYNC_COMPAT_TIMEOUT_SECONDS = 15
+OPTIONAL_POPUP_TIMEOUT_MS = 5000
 SHORT_SLEEP_SECONDS = 2
 LOGIN_ACTION_DELAY_SECONDS = 2
 MANUAL_LOGIN_TIMEOUT_SECONDS = 300
@@ -105,8 +109,16 @@ def normalize_cookie_for_playwright(cookie: dict[str, Any], fallback_url: str) -
 
 
 def save_pickle(path: Path, value: Any) -> None:
-    with path.open("wb") as file_obj:
-        pickle.dump(value, file_obj)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary_path.open("wb") as file_obj:
+            pickle.dump(value, file_obj)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def load_pickle(path: Path) -> Any:
@@ -144,7 +156,11 @@ def run_async_compat(async_fn: Callable[..., Any], *args: Any, **kwargs: Any) ->
 
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
-    thread.join()
+    thread.join(timeout=ASYNC_COMPAT_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        raise TimeoutError(
+            f"Async operation did not finish within {ASYNC_COMPAT_TIMEOUT_SECONDS} seconds"
+        )
 
     if "value" in error:
         raise error["value"]
@@ -156,6 +172,20 @@ def string_to_int(value: str) -> int:
     if digits in {"", "-"}:
         return 0
     return int(digits)
+
+
+def parse_balance(value: str) -> int:
+    digits = re.sub(r"[^\d-]", "", value or "")
+    if digits in {"", "-"}:
+        raise ValueError(f"Balance is not numeric: {value!r}")
+    return int(digits)
+
+
+def env_flag(key: str, default: bool = False) -> bool:
+    raw_value = os.getenv(key)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def read_ws_uri(default: str = "", *, announce: bool = False) -> str:
@@ -583,12 +613,12 @@ def open_openbank_page(session: PlaywrightSession) -> Page:
 
 def confirm_optional_popup(page: Page, trigger: Callable[[], None]) -> None:
     try:
-        with page.expect_popup() as popup_info:
+        with page.expect_popup(timeout=OPTIONAL_POPUP_TIMEOUT_MS) as popup_info:
             trigger()
         popup = popup_info.value
         popup.frame_locator("iframe").get_by_role("button", name="확인완료").click()
         popup.close()
-    except Exception:
+    except PlaywrightTimeoutError:
         pass
 
 
@@ -607,15 +637,17 @@ def agree_openbank_terms(page: Page) -> None:
 
 
 def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
-    time.sleep(1)  # Wait for all rows to load
-    page.get_by_role("cell", name="신한은행").first.wait_for(timeout=DEFAULT_WAIT_MS)
     rows = page.get_by_role("table").locator("tr")
-    print("Total rows found:", rows.count())
+    rows.locator("td").first.wait_for(state="visible", timeout=DEFAULT_WAIT_MS)
+    row_count = rows.count()
+    if row_count == 0:
+        raise RuntimeError("Openbank table loaded without rows")
+    print("Total rows found:", row_count)
     collected_rows: list[list[Any]] = []
-    for index in range(rows.count()):
+    for index in range(row_count):
         row = rows.nth(index)
         cells = row.locator("td")
-        if cells.count() < 5:
+        if cells.count() < 6:
             continue
         bank_name = cells.nth(1).inner_text().strip()
         account_type = cells.nth(2).inner_text().strip()
@@ -630,7 +662,7 @@ def scrape_openbank_accounts(page: Page) -> list[list[Any]]:
                 account_type,
                 account_number,
                 account_name,
-                string_to_int(account_value),
+                parse_balance(account_value),
             ]
         )
     return collected_rows
@@ -648,43 +680,70 @@ def open_my_asset_page(page: Page) -> None:
 def scrape_kb_securities_accounts(page: Page) -> list[list[Any]]:
     collected_rows: list[list[Any]] = []
 
-    row_index = 0
-    while True:
-        try:
-            collected_rows.append(
-                [
-                    "KB증권",
-                    "CMA",
-                    page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_0").inner_text().strip().replace("-", ""),
-                    "CMA",
-                    string_to_int(
-                        page.locator(f"#grid_gridTotalCMA_data_td_{row_index}_3").inner_text().strip()
-                    ),
-                ]
-            )
-        except Exception:
-            break
-        row_index += 1
+    cma_accounts = page.locator('[id^="grid_gridTotalCMA_data_td_"][id$="_0"]')
+    for row_index in range(cma_accounts.count()):
+        account_number = cma_accounts.nth(row_index).inner_text().strip().replace("-", "")
+        balance_text = page.locator(
+            f"#grid_gridTotalCMA_data_td_{row_index}_3"
+        ).inner_text().strip()
+        collected_rows.append(
+            ["KB증권", "CMA", account_number, "CMA", parse_balance(balance_text)]
+        )
 
-    row_index = 0
-    while True:
-        try:
-            collected_rows.append(
-                [
-                    "KB증권",
-                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_2").inner_text().strip(),
-                    page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_0").inner_text().strip().replace("-", ""),
-                    "종합위탁",
-                    string_to_int(
-                        page.locator(f"#grid_gridTotalSEC_data_td_{row_index}_3").inner_text().strip()
-                    ),
-                ]
-            )
-        except Exception:
-            break
-        row_index += 1
+    sec_accounts = page.locator('[id^="grid_gridTotalSEC_data_td_"][id$="_0"]')
+    for row_index in range(sec_accounts.count()):
+        account_number = sec_accounts.nth(row_index).inner_text().strip().replace("-", "")
+        account_type = page.locator(
+            f"#grid_gridTotalSEC_data_td_{row_index}_2"
+        ).inner_text().strip()
+        balance_text = page.locator(
+            f"#grid_gridTotalSEC_data_td_{row_index}_3"
+        ).inner_text().strip()
+        collected_rows.append(
+            ["KB증권", account_type, account_number, "종합위탁", parse_balance(balance_text)]
+        )
 
     return collected_rows
+
+
+def account_keys(rows: list[list[Any]]) -> set[str]:
+    return {
+        str(row[2]).strip().replace("-", "")
+        for row in rows
+        if isinstance(row, (list, tuple)) and len(row) >= 5 and str(row[2]).strip()
+    }
+
+
+def validate_collection_results(
+    collected_rows: list[list[Any]],
+    previous_rows: list[list[Any]] | None,
+) -> None:
+    current_keys = account_keys(collected_rows)
+    if not current_keys:
+        raise RuntimeError("No valid account rows were collected")
+    if len(current_keys) != len(collected_rows):
+        raise RuntimeError("Collected account rows contain duplicate or invalid account numbers")
+    if not previous_rows:
+        return
+
+    previous_keys = account_keys(previous_rows)
+    if not previous_keys:
+        return
+    matched_count = len(previous_keys & current_keys)
+    ratio = matched_count / len(previous_keys)
+    minimum_ratio = float(
+        os.getenv("MIN_ACCOUNT_COLLECTION_RATIO", str(DEFAULT_MIN_SCRAPE_RATIO))
+    )
+    log_message(
+        f"Collection coverage against previous run: {matched_count}/{len(previous_keys)} ({ratio:.1%})"
+    )
+    if not 0 < minimum_ratio <= 1:
+        raise ValueError("MIN_ACCOUNT_COLLECTION_RATIO must be greater than 0 and at most 1")
+    if ratio < minimum_ratio:
+        raise RuntimeError(
+            "Collected account coverage dropped below the safety threshold: "
+            f"{ratio:.1%} < {minimum_ratio:.1%}"
+        )
 
 
 def save_collection_results(
@@ -692,6 +751,15 @@ def save_collection_results(
     config: KBConfig,
     collected_rows: list[list[Any]],
 ) -> None:
+    previous_rows: list[list[Any]] | None = None
+    if config.openbank_pickle_file.is_file():
+        try:
+            loaded = load_pickle(config.openbank_pickle_file)
+            if isinstance(loaded, list):
+                previous_rows = loaded
+        except Exception as exc:
+            log_message(f"Previous collection could not be validated: {exc}")
+    validate_collection_results(collected_rows, previous_rows)
     save_pickle(config.openbank_pickle_file, collected_rows)
     log_message(f"Saving results - Accounts={len(collected_rows)}")
     if not session.save_cookies(config.cookie_file, config.url_main):
@@ -765,6 +833,8 @@ def run_collection_cycle(session: PlaywrightSession, config: KBConfig, runtime: 
 
 
 def pull_latest_changes() -> None:
+    if not env_flag("AUTO_PULL_UPDATES"):
+        return
     try:
         print("Start update Process")
         repo = git.Repo("./")
@@ -774,13 +844,22 @@ def pull_latest_changes() -> None:
         print("Update Git Failed :", exc)
 
 
-def run_kb_pipeline() -> None:
-    completed = subprocess.run(
-        [resolve_python_executable(), "KB.py"],
-        check=False,
+def run_kb_pipeline() -> bool:
+    timeout_seconds = int(
+        os.getenv("KB_PIPELINE_TIMEOUT_SECONDS", DEFAULT_PIPELINE_TIMEOUT_SECONDS)
     )
-    if completed.returncode != 0:
-        log_message(f"KB.py exited with code {completed.returncode}")
+    try:
+        subprocess.run(
+            [resolve_python_executable(), "KB.py"],
+            check=True,
+            timeout=timeout_seconds,
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        log_message(f"KB.py timed out after {timeout_seconds} seconds")
+    except subprocess.CalledProcessError as exc:
+        log_message(f"KB.py exited with code {exc.returncode}")
+    return False
 
 
 def final_proc(session: PlaywrightSession, config: KBConfig, runtime: RuntimeState) -> None:
@@ -812,7 +891,12 @@ def main() -> bool:
         user_data_dir=config.chrome_user_data_dir,
         headless=False,
     )
-    session.start()
+    try:
+        session.start()
+    except Exception as exc:
+        log_message(f"Playwright browser start failed: {exc}")
+        session.close()
+        return False
     atexit.register(final_proc, session, config, runtime)
 
     last_run = dt.datetime.now() - dt.timedelta(days=1)
@@ -830,11 +914,18 @@ def main() -> bool:
 
         if not cycle_completed:
             log_message("KB check 실패")
+            try:
+                session.launch()
+                log_message("Playwright browser restarted after collection failure")
+            except Exception as exc:
+                log_message(f"Playwright browser restart failed: {exc}")
             continue
 
         session.save_cookies(config.cookie_file, config.url_main)
         pull_latest_changes()
-        run_kb_pipeline()
+        if not run_kb_pipeline():
+            log_message("KB database pipeline failed; collection will be retried")
+            continue
         print("===Done===")
 
         retries = 0

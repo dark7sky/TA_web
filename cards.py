@@ -114,10 +114,6 @@ def Analysis_sheet(
             
             elif vendor_type == "2":
                 value = parse_number(row[value_column].value)
-                if len(row) > value_column + 2:
-                    if row[value_column + 2].value == "승인취소":
-                        value = -value
-                        
             elif vendor_type == "3":
                 value = parse_number(row[value_column].value) - parse_number(row[value_column + 1].value)
                 
@@ -192,7 +188,8 @@ def card_analysis(sheetname: str, ws: Worksheet) -> list | tuple[str, Exception]
         first_id = str(ws["A1"].value).strip()
         if first_id == "거래일":
             day_column = 0
-            value_column = 5
+            headers = [str(cell.value).strip() if cell.value is not None else "" for cell in ws[1]]
+            value_column = headers.index("금액") if "금액" in headers else 5
             vendor_type = "2"
             time_format = "%Y.%m.%d %H:%M"
             total_day_val = str(ws["A2"].value).strip()

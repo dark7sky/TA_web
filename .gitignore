@@ -39,6 +39,7 @@ debug
 !grapher.py
 !migrate_db.py
 !sqlite3_to_influxed.py
+!tests/*.py
 
 # Python cache
 __pycache__/
