@@ -74,5 +74,26 @@ class CardBalanceTests(unittest.TestCase):
         cards_mod.main.assert_called_once()
 
 
+class TotalSanityTests(unittest.TestCase):
+    def test_validate_total_accepts_current_range(self) -> None:
+        accounts = {
+            "a": KB.AccountSnapshot(account_key="a", balance=60_000_000, company="bank"),
+            "b": KB.AccountSnapshot(account_key="b", balance=55_000_000, company="bank"),
+        }
+
+        with patch.dict("os.environ", {"MIN_CORE_TOTAL_AMOUNT": "100000000"}):
+            KB.validate_total(accounts)
+
+    def test_validate_total_rejects_below_configured_floor(self) -> None:
+        accounts = {
+            "a": KB.AccountSnapshot(account_key="a", balance=40_000_000, company="bank"),
+            "b": KB.AccountSnapshot(account_key="b", balance=20_000_000, company="bank"),
+        }
+
+        with patch.dict("os.environ", {"MIN_CORE_TOTAL_AMOUNT": "100000000"}):
+            with self.assertRaisesRegex(ValueError, "below 100,000,000"):
+                KB.validate_total(accounts)
+
+
 if __name__ == "__main__":
     unittest.main()

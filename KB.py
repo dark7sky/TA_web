@@ -42,6 +42,8 @@ EXCEPTION_ACCOUNTS_ENV = "EXCEPTION_ACCOUNTS"
 TA_WEB_LAST_CRAWLED_AT_KEY = "ta_web_last_crawled_at"
 MIN_COLLECTION_RATIO_ENV = "MIN_ACCOUNT_COLLECTION_RATIO"
 DEFAULT_MIN_COLLECTION_RATIO = 0.8
+MIN_CORE_TOTAL_ENV = "MIN_CORE_TOTAL_AMOUNT"
+DEFAULT_MIN_CORE_TOTAL = 100_000_000
 
 KNOWN_SPECIAL_KEYS = {
     "accounts_cards",
@@ -400,8 +402,11 @@ def apply_card_balance(cur: Any, last_update: dict[str, float], accounts: Accoun
 def validate_total(accounts: Accounts) -> None:
     total = sum(snapshot.balance for snapshot in accounts.values())
     log(f"Sanity total: {total:,}")
-    if total <= 150_000_000:
-        raise ValueError("Total below 150,000,000; aborting as suspicious")
+    minimum_total = int(os.getenv(MIN_CORE_TOTAL_ENV, str(DEFAULT_MIN_CORE_TOTAL)))
+    if total <= minimum_total:
+        raise ValueError(
+            f"Total below {minimum_total:,}; aborting as suspicious"
+        )
 
 
 def filter_accounts(accounts: Accounts, exclusions: ExclusionRules) -> Accounts:
